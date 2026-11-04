@@ -27,6 +27,7 @@ authors = [{ name = "Google LLC" }]
 dependencies = [
     "mlflow>=3.17.2",
     "google-auth>=2.15.0",
+    "google-cloud-storage>=2.14.0",
     "requests>=2.32.3",
 ]
 
@@ -49,6 +50,9 @@ Repository = "https://github.com/GoogleCloudPlatform/google-cloud-managed-mlflow
 
 [project.entry-points."mlflow.request_auth_provider"]
 google-cloud-auth = "google_cloud_managed_mlflow.auth:GoogleCloudAuthProvider"
+
+[project.entry-points."mlflow.artifact_repository"]
+gs = "google_cloud_managed_mlflow.gcs_artifact_repo:GcpGCSArtifactRepository"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -76,7 +80,13 @@ strict = true
 files = ["google_cloud_managed_mlflow", "tests"]
 exclude = ["^(build|dist)/"]
 disallow_subclassing_any = false
-untyped_calls_exclude = ["mlflow", "google.auth"]
+untyped_calls_exclude = [
+    "mlflow",
+    "google.auth",
+    "google.api_core",
+    "google.cloud",
+    "google.oauth2",
+]
 
 [[tool.mypy.overrides]]
 module = ["mlflow.*", "google.*"]
@@ -85,4 +95,3 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
-
