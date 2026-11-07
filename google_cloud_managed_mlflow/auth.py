@@ -16,14 +16,12 @@
 
 from __future__ import annotations
 
-import ipaddress
 import os
-import re
 import ssl
 import threading
 import urllib.parse
 from collections.abc import MutableMapping
-from typing import Any, ClassVar, NamedTuple, Protocol
+from typing import Any, ClassVar, Protocol
 
 import google.auth
 import google.auth.exceptions
@@ -38,34 +36,26 @@ from mlflow.tracking.request_auth.abstract_request_auth_provider import (
     RequestAuthProvider,
 )
 
+from google_cloud_managed_mlflow._validation import (
+    _contains_control_chars,
+    _is_allowed_destination,
+    _parse_validated_endpoint_url,
+)
+
 CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 AUTH_PROVIDER_NAME = "google-cloud-auth"
 
-_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
-_GOOGLEAPIS_DOMAIN_SUFFIX = ".googleapis.com"
-_DNS_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
-_UNBRACKETED_HOST_RE = re.compile(r"^[a-z0-9_-]+(?:\.[a-z0-9_-]+)*$")
-
-
-class _EndpointOrigin(NamedTuple):
-    """Normalized (scheme, hostname, effective_port) endpoint origin."""
-
-    scheme: str
-    hostname: str
-    port: int
-
-    def __str__(self) -> str:
-        host_display = f"[{self.hostname}]" if ":" in self.hostname else self.hostname
-        return f"{self.scheme}://{host_display}:{self.port}"
-
-
-def _contains_control_chars(value: str) -> bool:
-    """Return True if value contains ASCII C0 or DEL control characters.
-
-    Must run before urllib.parse.urlsplit/urljoin, which silently strip
-    '\\t', '\\r', and '\\n' (bpo-43882).
-    """
-    return any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value)
+__all__ = [
+    "AUTH_PROVIDER_NAME",
+    "CLOUD_PLATFORM_SCOPE",
+    "CredentialsProtocol",
+    "GoogleCloudAuthProvider",
+    "GoogleCloudBearerAuth",
+    "create_secure_session",
+    "ensure_auth_provider_registered",
+    "is_truthy_env",
+    "validate_transport_security",
+]
 
 
 class CredentialsProtocol(Protocol):
@@ -94,115 +84,6 @@ def is_truthy_env(var_name: str) -> bool:
 def _is_tls_verification_disabled(verify: Any) -> bool:
     """Return True if TLS verification is explicitly disabled or empty."""
     return not verify or (isinstance(verify, str) and not verify.strip())
-
-
-def _parse_validated_endpoint_url(raw_url: str) -> _EndpointOrigin:
-    """Parse and validate URL scheme, host, effective port, and HTTP policy."""
-    if not raw_url:
-        raise MlflowException(
-            "Endpoint URL must be a non-empty string.",
-            error_code=INVALID_PARAMETER_VALUE,
-        )
-
-    if _contains_control_chars(raw_url):
-        raise MlflowException(
-            "Endpoint URL contains invalid control characters.",
-            error_code=INVALID_PARAMETER_VALUE,
-        )
-
-    if raw_url[0].isspace() or raw_url[-1].isspace():
-        raise MlflowException(
-            "Endpoint URL must be a non-empty string without "
-            "leading/trailing whitespace.",
-            error_code=INVALID_PARAMETER_VALUE,
-        )
-
-    try:
-        parsed = urllib.parse.urlsplit(raw_url)
-        raw_port = parsed.port
-    except ValueError as exc:
-        raise MlflowException(
-            "Endpoint URL is malformed or contains an invalid port.",
-            error_code=INVALID_PARAMETER_VALUE,
-        ) from exc
-
-    if raw_port == 0:
-        raise MlflowException(
-            "Endpoint URL is malformed or contains an invalid port.",
-            error_code=INVALID_PARAMETER_VALUE,
-        )
-
-    raw_hostname = (parsed.hostname or "").lower()
-    if (
-        not parsed.scheme
-        or not raw_hostname.rstrip(".")
-        or "@" in parsed.netloc
-        or "\\" in parsed.netloc
-        or any(ch.isspace() for ch in parsed.netloc)
-    ):
-        raise MlflowException(
-            "Endpoint URL must include a valid scheme and host.",
-            error_code=INVALID_PARAMETER_VALUE,
-        )
-
-    if "[" in parsed.netloc or "]" in parsed.netloc:
-        try:
-            if "%" in raw_hostname:
-                raise ValueError("IPv6 zone identifiers are not supported.")
-            hostname = ipaddress.IPv6Address(raw_hostname).compressed
-        except ValueError as exc:
-            raise MlflowException(
-                "Endpoint URL contains an invalid IPv6 host literal.",
-                error_code=INVALID_PARAMETER_VALUE,
-            ) from exc
-    else:
-        hostname = raw_hostname.rstrip(".")
-        if not _UNBRACKETED_HOST_RE.fullmatch(hostname):
-            raise MlflowException(
-                "Endpoint URL contains invalid characters in host.",
-                error_code=INVALID_PARAMETER_VALUE,
-            )
-
-    scheme = parsed.scheme.lower()
-    if scheme not in ("https", "http"):
-        raise MlflowException(
-            f"Invalid scheme '{scheme}': only https:// and loopback http:// "
-            "are allowed.",
-            error_code=INVALID_PARAMETER_VALUE,
-        )
-
-    if scheme == "http" and hostname not in _LOOPBACK_HOSTS:
-        raise MlflowException(
-            f"Insecure HTTP is only permitted on loopback addresses "
-            f"({', '.join(sorted(_LOOPBACK_HOSTS))}); got '{hostname}'.",
-            error_code=INVALID_PARAMETER_VALUE,
-        )
-
-    effective_port = (
-        raw_port if raw_port is not None else (443 if scheme == "https" else 80)
-    )
-    return _EndpointOrigin(scheme, hostname, effective_port)
-
-
-def _is_allowed_destination(origin: _EndpointOrigin) -> bool:
-    """Return True if origin is an allowed Google Cloud or override destination."""
-    if (
-        origin.scheme == "https"
-        and origin.port == 443
-        and origin.hostname.endswith(_GOOGLEAPIS_DOMAIN_SUFFIX)
-        and all(_DNS_LABEL_RE.fullmatch(label) for label in origin.hostname.split("."))
-    ):
-        return True
-
-    override_raw = os.environ.get("MLFLOW_GCP_ENDPOINT_OVERRIDE", "").strip(" ")
-    if override_raw:
-        try:
-            override_origin = _parse_validated_endpoint_url(override_raw)
-        except MlflowException:
-            return False
-        return origin == override_origin
-
-    return False
 
 
 def validate_transport_security(
@@ -312,6 +193,31 @@ def _create_tls12_ssl_context() -> ssl.SSLContext:
     return ctx
 
 
+def _normalize_tls_paths(
+    verify: bool | str | bytes | os.PathLike[Any],
+    cert: Any = None,
+) -> tuple[Any, Any]:
+    """Normalize verify and cert paths to strings/tuples for pooling and SSLContext."""
+    norm_verify: Any = (
+        os.fspath(verify) if isinstance(verify, (str, bytes, os.PathLike)) else verify
+    )
+    if isinstance(norm_verify, bytes):
+        norm_verify = os.fsdecode(norm_verify)
+
+    norm_cert: Any = cert
+    if isinstance(cert, (str, bytes, os.PathLike)):
+        norm_cert = os.fsdecode(os.fspath(cert))
+    elif isinstance(cert, (list, tuple)) and len(cert) == 2:
+        norm_cert = (
+            os.fsdecode(os.fspath(cert[0])),
+            os.fsdecode(os.fspath(cert[1])),
+        )
+    elif isinstance(cert, list):
+        norm_cert = tuple(cert)
+
+    return norm_verify, norm_cert
+
+
 def _build_pool_ssl_context(verify: Any = True, cert: Any = None) -> ssl.SSLContext:
     """Build an isolated TLS 1.2+ SSLContext for a specific (verify, cert) pair."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -321,9 +227,11 @@ def _build_pool_ssl_context(verify: Any = True, cert: Any = None) -> ssl.SSLCont
     if getattr(ctx, "post_handshake_auth", None) is not None:
         ctx.post_handshake_auth = True
 
-    ca_loc = (
-        verify if isinstance(verify, str) else requests.utils.DEFAULT_CA_BUNDLE_PATH
-    )
+    norm_verify, normalized_cert = _normalize_tls_paths(verify, cert)
+    if isinstance(norm_verify, str):
+        ca_loc: Any = norm_verify
+    else:
+        ca_loc = requests.utils.DEFAULT_CA_BUNDLE_PATH
     if ca_loc:
         if os.path.isdir(ca_loc):
             ctx.load_verify_locations(capath=ca_loc)
@@ -332,23 +240,23 @@ def _build_pool_ssl_context(verify: Any = True, cert: Any = None) -> ssl.SSLCont
     else:
         ctx.load_default_certs()
 
-    if cert is not None:
-        if isinstance(cert, tuple) and len(cert) == 2:
-            cert_path, key_path = cert
+    if normalized_cert is not None:
+        if isinstance(normalized_cert, tuple) and len(normalized_cert) == 2:
+            cert_path, key_path = normalized_cert
             if os.path.exists(cert_path) and os.path.exists(key_path):
                 ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
-        elif isinstance(cert, (str, bytes)) and os.path.exists(cert):
-            ctx.load_cert_chain(certfile=cert)
+        elif isinstance(normalized_cert, str) and os.path.exists(normalized_cert):
+            ctx.load_cert_chain(certfile=normalized_cert)
     return ctx
 
 
 def _cert_paths_exist(verify: Any, cert: Any) -> bool:
     """Return True if user-supplied verify/cert paths exist on disk."""
-    if isinstance(verify, str) and not os.path.exists(verify):
+    if isinstance(verify, (str, bytes, os.PathLike)) and not os.path.exists(verify):
         return False
-    if isinstance(cert, tuple) and len(cert) == 2:
+    if isinstance(cert, (tuple, list)) and len(cert) == 2:
         return os.path.exists(cert[0]) and os.path.exists(cert[1])
-    if isinstance(cert, (str, bytes)):
+    if isinstance(cert, (str, bytes, os.PathLike)):
         return os.path.exists(cert)
     return True
 
@@ -379,19 +287,21 @@ class _Tls12HttpAdapter(requests.adapters.HTTPAdapter):
     def build_connection_pool_key_attributes(
         self,
         request: requests.PreparedRequest,
-        verify: bool | str,
-        cert: str | tuple[str, str] | None = None,
+        verify: bool | str | bytes | os.PathLike[Any],
+        cert: Any = None,
     ) -> Any:
+        norm_verify, norm_cert = _normalize_tls_paths(verify, cert)
+
         host_params, pool_kwargs = super().build_connection_pool_key_attributes(
-            request, verify, cert
+            request, norm_verify, norm_cert
         )
         raw_pool_kwargs: dict[str, Any] = dict(pool_kwargs)
-        key = (verify, cert)
+        key = (norm_verify, norm_cert)
         with self._ssl_lock:
             ctx = self._ssl_contexts.get(key)
             if ctx is None:
-                ctx = _build_pool_ssl_context(verify=verify, cert=cert)
-                if _cert_paths_exist(verify, cert):
+                ctx = _build_pool_ssl_context(verify=norm_verify, cert=norm_cert)
+                if _cert_paths_exist(norm_verify, norm_cert):
                     self._ssl_contexts[key] = ctx
         raw_pool_kwargs["ssl_context"] = ctx
         return host_params, raw_pool_kwargs

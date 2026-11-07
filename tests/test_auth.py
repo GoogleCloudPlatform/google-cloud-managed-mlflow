@@ -55,15 +55,16 @@ from mlflow.tracking.request_auth.abstract_request_auth_provider import (
 )
 
 import google_cloud_managed_mlflow
+from google_cloud_managed_mlflow._validation import (
+    _EndpointOrigin,
+    _is_allowed_destination,
+)
 from google_cloud_managed_mlflow.auth import (
     AUTH_PROVIDER_NAME,
     CLOUD_PLATFORM_SCOPE,
-    CredentialsProtocol,
     GoogleCloudAuthProvider,
     GoogleCloudBearerAuth,
     _create_tls12_ssl_context,
-    _EndpointOrigin,
-    _is_allowed_destination,
     _is_tls_verification_disabled,
     _Tls12HttpAdapter,
     _validate_redirect_target,
@@ -495,11 +496,7 @@ def test_tls12_ssl_context_and_create_secure_session(tmp_path: Path) -> None:
     if getattr(ctx, "post_handshake_auth", None) is not None:
         assert ctx.post_handshake_auth is True
 
-    assert {"create_secure_session", "CredentialsProtocol"} <= set(
-        google_cloud_managed_mlflow.__all__
-    )
-    assert google_cloud_managed_mlflow.create_secure_session is create_secure_session
-    assert google_cloud_managed_mlflow.CredentialsProtocol is CredentialsProtocol
+    assert google_cloud_managed_mlflow.__all__ == ["__version__"]
 
     ca1_cert, ca1_key = _generate_self_signed_cert(tmp_path, "ca1")
     ca2_cert, ca2_key = _generate_self_signed_cert(tmp_path, "ca2")
@@ -577,6 +574,53 @@ def test_tls12_adapter_rejects_disabled_verify() -> None:
         for bad_verify in (False, None, "", "   "):
             with _raises_invalid_param():
                 adapter.send(req, verify=bad_verify)
+    finally:
+        adapter.close()
+
+
+def test_tls12_adapter_ssl_context_caching_and_path_normalization(
+    tmp_path: Path,
+) -> None:
+    """Verify Path vs str and list vs tuple normalization share cached SSLContexts."""
+    ca_cert, ca_key = _generate_self_signed_cert(tmp_path, "pool_ca")
+    cert2, key2 = _generate_self_signed_cert(tmp_path, "pool_cert")
+    combined_pem = tmp_path / "combined.pem"
+    combined_pem.write_bytes(cert2.read_bytes() + key2.read_bytes())
+
+    adapter = _Tls12HttpAdapter()
+    try:
+        req = _prep("https://mlflow.googleapis.com")
+
+        # 1. Path vs str for verify
+        _, kw_path = adapter.build_connection_pool_key_attributes(req, verify=ca_cert)
+        _, kw_str = adapter.build_connection_pool_key_attributes(
+            req, verify=str(ca_cert)
+        )
+        assert kw_path["ssl_context"] is kw_str["ssl_context"]
+        assert (str(ca_cert), None) in adapter._ssl_contexts
+        assert len(adapter._ssl_contexts) == 1
+
+        # 2. Path vs str for cert
+        _, kw_cert_path = adapter.build_connection_pool_key_attributes(
+            req, verify=True, cert=combined_pem
+        )
+        _, kw_cert_str = adapter.build_connection_pool_key_attributes(
+            req, verify=True, cert=str(combined_pem)
+        )
+        assert kw_cert_path["ssl_context"] is kw_cert_str["ssl_context"]
+        assert (True, str(combined_pem)) in adapter._ssl_contexts
+        assert len(adapter._ssl_contexts) == 2
+
+        # 3. [Path(c), Path(k)] list vs (c, k) tuple
+        _, kw_list = adapter.build_connection_pool_key_attributes(
+            req, verify=True, cert=[cert2, key2]
+        )
+        _, kw_tuple = adapter.build_connection_pool_key_attributes(
+            req, verify=True, cert=(str(cert2), str(key2))
+        )
+        assert kw_list["ssl_context"] is kw_tuple["ssl_context"]
+        assert (True, (str(cert2), str(key2))) in adapter._ssl_contexts
+        assert len(adapter._ssl_contexts) == 3
     finally:
         adapter.close()
 
@@ -1146,5 +1190,5 @@ def test_wheel_packaging_metadata_and_dynamic_version(
     assert len(installed_dists) == 1
     assert installed_dists[0].version == google_cloud_managed_mlflow.__version__
     requires = installed_dists[0].requires or []
-    assert "mlflow>=2.8.0" in requires
+    assert "mlflow>=3.17.2" in requires
     assert "requests>=2.32.3" in requires
