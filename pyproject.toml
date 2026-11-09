@@ -51,6 +51,9 @@ Repository = "https://github.com/GoogleCloudPlatform/google-cloud-managed-mlflow
 [project.entry-points."mlflow.request_auth_provider"]
 google-cloud-auth = "google_cloud_managed_mlflow.auth:GoogleCloudAuthProvider"
 
+[project.entry-points."mlflow.tracking_store"]
+https = "google_cloud_managed_mlflow.tracking_store:build_tracking_store"
+
 [project.entry-points."mlflow.artifact_repository"]
 gs = "google_cloud_managed_mlflow.gcs_artifact_repo:GcpGCSArtifactRepository"
 
@@ -73,6 +76,9 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
 
 [tool.mypy]
 python_version = "3.10"

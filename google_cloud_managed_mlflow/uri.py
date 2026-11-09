@@ -146,9 +146,19 @@ class ParsedGcpUri(NamedTuple):
         return f"{self.origin}/{self.api_version}"
 
     @property
+    def base_api_url(self) -> str:
+        """Return the canonical base API URL (origin/api_version)."""
+        return self.api_root
+
+    @property
     def resource_url(self) -> str:
         """Return the canonical full resource URL."""
         return f"{self.origin}/{self.api_version}/{self.resource_name}"
+
+    @property
+    def full_endpoint_url(self) -> str:
+        """Return the canonical full endpoint URL."""
+        return self.resource_url
 
     @property
     def is_namespace(self) -> bool:
@@ -410,7 +420,7 @@ def _validate_custom_verb(verb: str) -> str:
     return cleaned
 
 
-def _validate_path_segments(raw_path: str, *, context: str = "suffix") -> None:
+def validate_path_segments(raw_path: str, *, context: str = "suffix") -> None:
     """Validate a URL path component against traversal and delimiter attacks.
 
     Args:
@@ -556,6 +566,10 @@ def _validate_path_segments(raw_path: str, *, context: str = "suffix") -> None:
                 "traversal segments.",
                 error_code=INVALID_PARAMETER_VALUE,
             )
+
+
+# Alias for backward compatibility
+_validate_path_segments = validate_path_segments
 
 
 def build_gcp_api_url(

@@ -496,7 +496,11 @@ def test_tls12_ssl_context_and_create_secure_session(tmp_path: Path) -> None:
     if getattr(ctx, "post_handshake_auth", None) is not None:
         assert ctx.post_handshake_auth is True
 
-    assert google_cloud_managed_mlflow.__all__ == ["__version__"]
+    assert google_cloud_managed_mlflow.__all__ == [
+        "__version__",
+        "GcpTrackingRestStore",
+        "build_tracking_store",
+    ]
 
     ca1_cert, ca1_key = _generate_self_signed_cert(tmp_path, "ca1")
     ca2_cert, ca2_key = _generate_self_signed_cert(tmp_path, "ca2")
@@ -1192,3 +1196,28 @@ def test_wheel_packaging_metadata_and_dynamic_version(
     requires = installed_dists[0].requires or []
     assert "mlflow>=3.17.2" in requires
     assert "requests>=2.32.3" in requires
+
+
+def test_is_gcp_request_url_fail_closed_and_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from google_cloud_managed_mlflow.auth import _is_gcp_request_url
+
+    # Standard Google Cloud hosts
+    assert _is_gcp_request_url("https://mlflow.googleapis.com/v1/projects/p") is True
+    assert _is_gcp_request_url("https://us-central1-mlflow.googleapis.com/v1") is True
+    assert _is_gcp_request_url("https://googleapis.com/test") is True
+
+    # Non-GCP hosts
+    assert _is_gcp_request_url("https://custom-mlflow.internal:5000/api/2.0") is False
+    assert _is_gcp_request_url("https://mlflow.example.com/api/2.0") is False
+    assert _is_gcp_request_url("") is False
+    assert _is_gcp_request_url(None) is False
+
+    # Malformed URL fails closed (returns True)
+    assert _is_gcp_request_url("https://[invalid-ipv6/path") is True
+
+    # Override endpoint matching
+    monkeypatch.setenv("MLFLOW_GCP_ENDPOINT_OVERRIDE", "https://localhost:8080")
+    assert _is_gcp_request_url("https://localhost:8080/api/2.0") is True
+    assert _is_gcp_request_url("https://otherhost:8080/api/2.0") is False

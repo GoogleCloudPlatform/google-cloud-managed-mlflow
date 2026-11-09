@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import ssl
 import threading
@@ -42,6 +43,8 @@ from google_cloud_managed_mlflow._validation import (
     _parse_validated_endpoint_url,
 )
 
+_logger = logging.getLogger(__name__)
+
 CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 AUTH_PROVIDER_NAME = "google-cloud-auth"
 
@@ -53,6 +56,7 @@ __all__ = [
     "GoogleCloudBearerAuth",
     "create_secure_session",
     "ensure_auth_provider_registered",
+    "harden_mlflow_request_session",
     "is_truthy_env",
     "validate_transport_security",
 ]
@@ -84,6 +88,36 @@ def is_truthy_env(var_name: str) -> bool:
 def _is_tls_verification_disabled(verify: Any) -> bool:
     """Return True if TLS verification is explicitly disabled or empty."""
     return not verify or (isinstance(verify, str) and not verify.strip())
+
+
+def _is_gcp_request_url(url: str | None) -> bool:
+    """Return True if url targets a Google Cloud or override endpoint.
+
+    Fails closed: if parsing fails, returns True so that transport security
+    and TLS checks are never bypassed on malformed or ambiguous URLs.
+    """
+    if not url:
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        hostname = (parsed.hostname or "").lower()
+    except Exception:
+        # Fail closed on unparseable URLs so TLS verification is not bypassed
+        return True
+
+    if not hostname:
+        return False
+
+    override = os.environ.get("MLFLOW_GCP_ENDPOINT_OVERRIDE", "").strip()
+    if override:
+        try:
+            override_host = (urllib.parse.urlsplit(override).hostname or "").lower()
+            if override_host and hostname == override_host:
+                return True
+        except Exception:
+            return True
+
+    return hostname == "googleapis.com" or hostname.endswith(".googleapis.com")
 
 
 def validate_transport_security(
@@ -220,6 +254,15 @@ def _normalize_tls_paths(
 
 def _build_pool_ssl_context(verify: Any = True, cert: Any = None) -> ssl.SSLContext:
     """Build an isolated TLS 1.2+ SSLContext for a specific (verify, cert) pair."""
+    if _is_tls_verification_disabled(verify):
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        if getattr(ctx, "post_handshake_auth", None) is not None:
+            ctx.post_handshake_auth = True
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.verify_mode = ssl.CERT_REQUIRED
     ctx.check_hostname = True
@@ -327,7 +370,8 @@ class _Tls12HttpAdapter(requests.adapters.HTTPAdapter):
         cert: Any = None,
         proxies: Any = None,
     ) -> requests.Response:
-        if _is_tls_verification_disabled(verify):
+        url = getattr(request, "url", None)
+        if _is_tls_verification_disabled(verify) and _is_gcp_request_url(url):
             raise MlflowException(
                 "TLS verification cannot be disabled for Google Cloud connections.",
                 error_code=INVALID_PARAMETER_VALUE,
@@ -529,4 +573,83 @@ def ensure_auth_provider_registered() -> bool:
         _request_auth_provider_registry.register(GoogleCloudAuthProvider)
         return True
     except (ImportError, AttributeError, TypeError):
+        return False
+
+
+def harden_mlflow_request_session() -> bool:
+    """Harden MLflow's REST sessions to enforce TLS 1.2+ transport security.
+
+    Ensures requests made by MLflow's RestStore use a TLS 1.2+ adapter for https.
+    """
+    try:
+        import functools
+
+        target_modules: list[Any] = []
+        try:
+            import mlflow.utils.request_utils as req_utils
+
+            target_modules.append(req_utils)
+        except ImportError:
+            pass
+        try:
+            import mlflow.utils.rest_utils as rest_utils
+
+            target_modules.append(rest_utils)
+        except ImportError:
+            pass
+
+        def _create_hardened(func: Any) -> Any:
+            @functools.wraps(func)
+            def _hardened_cached_session(*args: Any, **kwargs: Any) -> requests.Session:
+                session: requests.Session = func(*args, **kwargs)
+                adapter = session.adapters.get("https://")
+                if not isinstance(adapter, _Tls12HttpAdapter):
+                    max_retries = getattr(
+                        adapter, "max_retries", requests.adapters.DEFAULT_RETRIES
+                    )
+                    pool_connections = getattr(
+                        adapter, "_pool_connections", requests.adapters.DEFAULT_POOLSIZE
+                    )
+                    pool_maxsize = getattr(
+                        adapter, "_pool_maxsize", requests.adapters.DEFAULT_POOLSIZE
+                    )
+                    pool_block = getattr(
+                        adapter, "_pool_block", requests.adapters.DEFAULT_POOLBLOCK
+                    )
+                    session.mount(
+                        "https://",
+                        _Tls12HttpAdapter(
+                            max_retries=max_retries,
+                            pool_connections=pool_connections,
+                            pool_maxsize=pool_maxsize,
+                            pool_block=pool_block,
+                        ),
+                    )
+                return session
+
+            _hardened_cached_session._is_hardened = True  # type: ignore[attr-defined]
+            if hasattr(func, "cache_clear"):
+                _hardened_cached_session.cache_clear = (  # type: ignore[attr-defined]
+                    func.cache_clear
+                )
+            if hasattr(func, "cache_info"):
+                _hardened_cached_session.cache_info = (  # type: ignore[attr-defined]
+                    func.cache_info
+                )
+            return _hardened_cached_session
+
+        for mod in target_modules:
+            cached_func = getattr(mod, "_cached_get_request_session", None)
+            if cached_func is not None and not getattr(
+                cached_func, "_is_hardened", False
+            ):
+                hardened = _create_hardened(cached_func)
+                mod._cached_get_request_session = hardened
+                if hasattr(cached_func, "cache_clear"):
+                    cached_func.cache_clear()
+        return True
+    except Exception as exc:
+        _logger.warning(
+            "Failed to harden MLflow REST session transport security: %s", exc
+        )
         return False

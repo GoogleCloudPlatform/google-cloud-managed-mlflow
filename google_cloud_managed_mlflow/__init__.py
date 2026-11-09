@@ -14,6 +14,69 @@
 
 """Google Cloud Managed Service for MLflow plugin."""
 
+from __future__ import annotations
+
+import importlib
+from typing import TYPE_CHECKING, Any
+
 __version__ = "0.1.0"
 
-__all__ = ["__version__"]
+if TYPE_CHECKING:
+    from google_cloud_managed_mlflow.auth import (
+        AUTH_PROVIDER_NAME as AUTH_PROVIDER_NAME,
+        CLOUD_PLATFORM_SCOPE as CLOUD_PLATFORM_SCOPE,
+        CredentialsProtocol as CredentialsProtocol,
+        GoogleCloudAuthProvider as GoogleCloudAuthProvider,
+        GoogleCloudBearerAuth as GoogleCloudBearerAuth,
+        create_secure_session as create_secure_session,
+        ensure_auth_provider_registered as ensure_auth_provider_registered,
+        harden_mlflow_request_session as harden_mlflow_request_session,
+        is_truthy_env as is_truthy_env,
+        validate_transport_security as validate_transport_security,
+    )
+    from google_cloud_managed_mlflow.tracking_store import (
+        GcpTrackingRestStore as GcpTrackingRestStore,
+        build_tracking_store as build_tracking_store,
+    )
+
+__all__ = [
+    "__version__",
+    "GcpTrackingRestStore",
+    "build_tracking_store",
+]
+
+_TRACKING_EXPORTS = frozenset(
+    {
+        "GcpTrackingRestStore",
+        "build_tracking_store",
+    }
+)
+
+_AUTH_EXPORTS = frozenset(
+    {
+        "AUTH_PROVIDER_NAME",
+        "CLOUD_PLATFORM_SCOPE",
+        "CredentialsProtocol",
+        "GoogleCloudAuthProvider",
+        "GoogleCloudBearerAuth",
+        "create_secure_session",
+        "ensure_auth_provider_registered",
+        "harden_mlflow_request_session",
+        "is_truthy_env",
+        "validate_transport_security",
+    }
+)
+
+
+def __getattr__(name: str) -> Any:
+    if name.startswith("__"):
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    if name in _TRACKING_EXPORTS:
+        tracking_store_mod = importlib.import_module(
+            "google_cloud_managed_mlflow.tracking_store"
+        )
+        return getattr(tracking_store_mod, name)
+    if name in _AUTH_EXPORTS:
+        auth_mod = importlib.import_module("google_cloud_managed_mlflow.auth")
+        return getattr(auth_mod, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
