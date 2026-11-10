@@ -34,6 +34,11 @@ if TYPE_CHECKING:
         is_truthy_env as is_truthy_env,
         validate_transport_security as validate_transport_security,
     )
+    from google_cloud_managed_mlflow.registry_store import (
+        GcpModelRegistryRestStore,
+        build_registry_store,
+        ensure_registry_store_registered,
+    )
     from google_cloud_managed_mlflow.tracking_store import (
         GcpTrackingRestStore as GcpTrackingRestStore,
         build_tracking_store as build_tracking_store,
@@ -41,9 +46,20 @@ if TYPE_CHECKING:
 
 __all__ = [
     "__version__",
+    "GcpModelRegistryRestStore",
     "GcpTrackingRestStore",
+    "build_registry_store",
     "build_tracking_store",
+    "ensure_registry_store_registered",
 ]
+
+_REGISTRY_EXPORTS = frozenset(
+    {
+        "GcpModelRegistryRestStore",
+        "build_registry_store",
+        "ensure_registry_store_registered",
+    }
+)
 
 _TRACKING_EXPORTS = frozenset(
     {
@@ -71,6 +87,10 @@ _AUTH_EXPORTS = frozenset(
 def __getattr__(name: str) -> Any:
     if name.startswith("__"):
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    if name in _REGISTRY_EXPORTS:
+        from google_cloud_managed_mlflow import registry_store as registry_store_mod
+
+        return getattr(registry_store_mod, name)
     if name in _TRACKING_EXPORTS:
         tracking_store_mod = importlib.import_module(
             "google_cloud_managed_mlflow.tracking_store"

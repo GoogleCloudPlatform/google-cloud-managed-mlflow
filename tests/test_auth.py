@@ -498,8 +498,11 @@ def test_tls12_ssl_context_and_create_secure_session(tmp_path: Path) -> None:
 
     assert google_cloud_managed_mlflow.__all__ == [
         "__version__",
+        "GcpModelRegistryRestStore",
         "GcpTrackingRestStore",
+        "build_registry_store",
         "build_tracking_store",
+        "ensure_registry_store_registered",
     ]
 
     ca1_cert, ca1_key = _generate_self_signed_cert(tmp_path, "ca1")

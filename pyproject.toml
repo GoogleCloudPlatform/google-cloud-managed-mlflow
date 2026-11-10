@@ -54,6 +54,9 @@ google-cloud-auth = "google_cloud_managed_mlflow.auth:GoogleCloudAuthProvider"
 [project.entry-points."mlflow.tracking_store"]
 https = "google_cloud_managed_mlflow.tracking_store:build_tracking_store"
 
+[project.entry-points."mlflow.model_registry_store"]
+https = "google_cloud_managed_mlflow.registry_store:build_registry_store"
+
 [project.entry-points."mlflow.artifact_repository"]
 gs = "google_cloud_managed_mlflow.gcs_artifact_repo:GcpGCSArtifactRepository"
 
