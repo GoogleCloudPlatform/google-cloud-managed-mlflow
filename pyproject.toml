@@ -46,6 +46,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+spark = [
+    "pyspark>=3.5.0",
+]
 dev = [
     "build>=1.0.0",
     "cryptography>=41.0.0",
@@ -77,6 +80,7 @@ https = "google_cloud_managed_mlflow.registry_store:build_registry_store"
 [project.entry-points."mlflow.artifact_repository"]
 gs = "google_cloud_managed_mlflow.gcs_artifact_repo:GcpGCSArtifactRepository"
 models = "google_cloud_managed_mlflow.models_artifact_repo:GcpModelsArtifactRepository"
+mlflow-gs = "google_cloud_managed_mlflow.spark.hooks:MlflowGsArtifactRepository"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -84,7 +88,7 @@ include = ["google_cloud_managed_mlflow*"]
 exclude = ["tests*"]
 
 [tool.setuptools.package-data]
-google_cloud_managed_mlflow = ["py.typed"]
+google_cloud_managed_mlflow = ["py.typed", "jars/*.jar"]
 
 # Must remain a literal in __init__.py so setuptools.config.expand.StaticModule
 # extracts __version__ via AST without importing runtime deps in isolated builds.
@@ -119,9 +123,33 @@ untyped_calls_exclude = [
 module = ["mlflow.*", "google.*"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = [
+    "requests.structures",
+    "pyspark.*",
+    "py4j.*",
+    "pyarrow.*",
+    "numpy.*",
+    "pandas.*",
+    "scipy.*",
+    "sklearn.*",
+    "skops.*",
+    "joblib.*",
+    "cloudpickle.*",
+    "torch.*",
+    "xgboost.*",
+    "werkzeug.*",
+]
+follow_imports = "skip"
+follow_imports_for_stubs = true
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+markers = [
+    "spark: local Spark (classic and Spark Connect) integration tests",
+]
 
 [tool.coverage.report]
 exclude_also = [

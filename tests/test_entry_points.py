@@ -47,6 +47,11 @@ EXPECTED_ENTRY_POINTS: tuple[tuple[str, str, str], ...] = (
         "models",
         "google_cloud_managed_mlflow.models_artifact_repo:GcpModelsArtifactRepository",
     ),
+    (
+        "mlflow.artifact_repository",
+        "mlflow-gs",
+        "google_cloud_managed_mlflow.spark.hooks:MlflowGsArtifactRepository",
+    ),
 )
 
 

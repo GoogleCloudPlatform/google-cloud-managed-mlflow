@@ -34,3 +34,8 @@ venv/
 .coverage
 coverage.xml
 htmlcov/
+
+# Java build artifacts (keep bundled provider JAR)
+java/build/
+.gradle/
+!google_cloud_managed_mlflow/jars/*.jar

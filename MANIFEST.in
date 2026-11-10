@@ -19,3 +19,4 @@ include LICENSE
 include README.md
 include pyproject.toml
 recursive-include tests *.py
+recursive-include google_cloud_managed_mlflow/jars *.jar
