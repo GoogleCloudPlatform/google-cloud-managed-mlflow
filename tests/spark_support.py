@@ -157,6 +157,51 @@ def _fs_gs_snapshot(spark: Any) -> dict[str, str]:
     return snapshot
 
 
+def _python_flavor_models(local: Any) -> list[tuple[str, str, Any, bool]]:
+    """Log XGBoost and PyTorch models trained on ``local`` (pandas).
+
+    Returns ``(flavor, model_uri, expected predictions ordered by x1,
+    float32_inputs)``; PyTorch signatures are float32 tensors.
+    """
+    import mlflow
+    import torch
+    import xgboost
+
+    features = local[["x1", "x2"]]
+    ordered = local.sort_values("x1")[["x1", "x2"]]
+    models: list[tuple[str, str, Any, bool]] = []
+    regressor = xgboost.XGBRegressor(n_estimators=20, max_depth=3).fit(
+        features, local["label"]
+    )
+    with mlflow.start_run():
+        info = mlflow.xgboost.log_model(
+            regressor,
+            name="model",
+            input_example=features[:3],
+            pip_requirements=["xgboost"],
+        )
+    models.append(("xgboost", info.model_uri, regressor.predict(ordered), False))
+    torch.manual_seed(0)
+    network = torch.nn.Sequential(
+        torch.nn.Linear(2, 8), torch.nn.Tanh(), torch.nn.Linear(8, 1)
+    ).eval()
+    with torch.no_grad():
+        values = torch.from_numpy(ordered.to_numpy(dtype=np.float32))
+        expected = network(values).numpy()[:, 0]
+    example = features[:4].to_numpy(dtype=np.float32)
+    for fmt in ("pickle", "pt2"):
+        with mlflow.start_run():
+            info = mlflow.pytorch.log_model(
+                network,
+                name="model",
+                input_example=example,
+                serialization_format=fmt,
+                pip_requirements=["torch"],
+            )
+        models.append((f"pytorch-{fmt}", info.model_uri, expected, True))
+    return models
+
+
 def _assert_no_executor_minting(server: FakeManagedMlflow) -> None:
     roles = {call.role for call in server.cab_calls_snapshot()}
     assert "java-executor" not in roles

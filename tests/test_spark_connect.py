@@ -23,10 +23,12 @@ from __future__ import annotations
 
 import dataclasses
 import glob
+import json
 import os
 import shutil
 import socket
 import subprocess
+import sys
 import time
 import uuid
 from collections.abc import Iterator
@@ -43,9 +45,11 @@ from google_cloud_managed_mlflow.spark import (
     hooks,
     runtime,
 )
+from tests import spark_models
 from tests.conftest import ManagedEnv
 from tests.fakes.mlflow_server import NAMESPACE_BUCKET, NAMESPACE_ROOT
 from tests.spark_support import (
+    ROWS,
     SparkEnv,
     _assert_client_supplier_round,
     _assert_no_executor_minting,
@@ -57,6 +61,7 @@ from tests.spark_support import (
     _features,
     _fit_pipeline,
     _gcs_names,
+    _python_flavor_models,
     _run_less_save_round,
     pyspark,
     spark_env,
@@ -66,6 +71,7 @@ pytestmark = pytest.mark.spark
 __all__ = ["spark_env"]
 
 CONNECT = "connect"
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _free_port() -> int:
@@ -99,9 +105,12 @@ def connect_server(spark_env: SparkEnv) -> Iterator[ConnectServer]:
     conf = _common_conf(spark_env)
     conf["spark.connect.grpc.binding.port"] = str(port)
     conf["spark.connect.grpc.binding.address"] = "127.0.0.1"
+    # Executors behave like serverless runtimes: no mlflow, no plugin.
     conf.update(_blocked_worker_conf(spark_env, CONNECT))
     for key, value in conf.items():
         command += ["--conf", f"{key}={value}"]
+    # Only the Cloud Storage connector is preinstalled; the provider JAR is
+    # uploaded by the plugin with SparkSession.addArtifacts.
     command += ["--jars", f"{connect_jars[0]},{spark_env.connector}"]
     command += [
         "--class",
@@ -151,6 +160,35 @@ def connect_spark(connect_server: ConnectServer) -> Iterator[Any]:
         runtime._SESSION_STATE.clear()
 
 
+@pytest.fixture(scope="module")
+def sparkxgb_models(spark_env: SparkEnv) -> Path:
+    """SparkXGB pipelines saved by a classic Spark job (see tests.spark_models)."""
+    output = spark_env.workdir / "sparkxgb-models"
+    output.mkdir()
+    env = dict(os.environ)
+    # This process already runs a Spark Connect client; the job must be classic.
+    for key in ("SPARK_CONNECT_MODE_ENABLED", "SPARK_REMOTE", "SPARK_LOCAL_REMOTE"):
+        env.pop(key, None)
+    env.update(
+        {
+            "PYTHONPATH": str(REPO_ROOT),
+            "MLFLOW_TRACKING_URI": (output / "mlruns").as_uri(),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+    )
+    completed = subprocess.run(
+        [sys.executable, "-m", "tests.spark_models", str(output)],
+        cwd=output,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=900,
+    )
+    assert completed.returncode == 0, completed.stderr[-4000:]
+    return output
+
+
 def test_connect_add_artifact_provider_and_executor_reads(
     managed: ManagedEnv, connect_spark: Any, spark_env: SparkEnv
 ) -> None:
@@ -175,9 +213,11 @@ def test_connect_add_artifact_provider_and_executor_reads(
     assert all("ya29." not in str(v) for v in conf.values())
 
 
-def test_connect_spark_model_log_register_and_load(
+def test_connect_spark_model_and_python_udf(
     managed: ManagedEnv, connect_spark: Any, spark_env: SparkEnv
 ) -> None:
+    from sklearn.linear_model import LinearRegression as SkLinearRegression
+
     frame = _features(connect_spark)
     model = _fit_pipeline(frame)
     expected = [
@@ -194,9 +234,126 @@ def test_connect_spark_model_log_register_and_load(
         row.prediction for row in from_registry.transform(frame).orderBy("x1").collect()
     ]
     np.testing.assert_allclose(got, expected, rtol=1e-9)
+
+    local = frame.toPandas()
+    sk_model = SkLinearRegression().fit(local[["x1", "x2"]], local["label"])
+    with mlflow.start_run():
+        info = mlflow.sklearn.log_model(
+            sk_model, name="model", input_example=local[["x1", "x2"]][:3]
+        )
+    udf = mlflow.pyfunc.spark_udf(connect_spark, info.model_uri, result_type="double")
+    rows = frame.withColumn("p", udf("x1", "x2")).orderBy("x1").collect()
+    assert len(rows) == ROWS
+    np.testing.assert_allclose(
+        [r.p for r in rows],
+        sk_model.predict(local.sort_values("x1")[["x1", "x2"]]),
+        rtol=1e-9,
+    )
     _assert_no_executor_minting(managed.server)
     assert spark_env.gcs.denied() == []
     _assert_workers_never_imported_plugin(spark_env, CONNECT)
+
+
+def test_connect_xgboost_and_pytorch_udfs_without_mlflow_on_workers(
+    managed: ManagedEnv, connect_spark: Any, spark_env: SparkEnv
+) -> None:
+    from pyspark.sql import functions as F
+
+    frame = _features(connect_spark)
+    for flavor, model_uri, expected, float32 in _python_flavor_models(frame.toPandas()):
+        udf = mlflow.pyfunc.spark_udf(connect_spark, model_uri, result_type="double")
+        columns = [
+            F.col(c).cast("float") if float32 else F.col(c) for c in ("x1", "x2")
+        ]
+        rows = frame.withColumn("p", udf(*columns)).orderBy("x1").collect()
+        assert len(rows) == ROWS, flavor
+        np.testing.assert_allclose([r.p for r in rows], expected, rtol=1e-5)
+    _assert_workers_never_imported_plugin(spark_env, CONNECT)
+    assert runtime.driver_stats(connect_spark)["executorCabRpcs"] == "0"
+    _assert_no_executor_minting(managed.server)
+    assert spark_env.gcs.denied() == []
+
+
+def test_connect_w6_jvm_pipeline_load_pyfunc_and_udf(
+    managed: ManagedEnv, connect_spark: Any, spark_env: SparkEnv
+) -> None:
+    from pyspark.ml import Pipeline
+    from pyspark.ml.classification import GBTClassifier
+    from pyspark.ml.feature import StandardScaler, VectorAssembler
+    from pyspark.sql import functions as F
+
+    frame = _features(connect_spark).withColumn(
+        "label_cls", (F.col("label") > 0.5).cast("double")
+    )
+    model = Pipeline(
+        stages=[
+            VectorAssembler(inputCols=["x1", "x2"], outputCol="raw"),
+            StandardScaler(
+                inputCol="raw", outputCol="features", withMean=True, withStd=True
+            ),
+            GBTClassifier(
+                featuresCol="features", labelCol="label_cls", maxIter=5, maxDepth=3
+            ),
+        ]
+    ).fit(frame)
+    expected = [r.prediction for r in model.transform(frame).orderBy("x1").collect()]
+    sample = frame.orderBy("x1").limit(50).toPandas()[["x1", "x2"]]
+    name = f"gbt-{uuid.uuid4().hex[:8]}"
+    with mlflow.start_run():
+        info = mlflow.spark.log_model(model, "gbt-model", registered_model_name=name)
+    for uri in (info.model_uri, f"models:/{name}/1"):
+        loaded = mlflow.spark.load_model(uri)
+        got = [r.prediction for r in loaded.transform(frame).orderBy("x1").collect()]
+        np.testing.assert_allclose(got, expected, rtol=1e-9)
+        predicted = mlflow.pyfunc.load_model(uri).predict(sample)
+        np.testing.assert_allclose(
+            np.asarray(predicted).reshape(-1), expected[:50], rtol=1e-9
+        )
+        udf = mlflow.pyfunc.spark_udf(connect_spark, uri)
+        rows = frame.withColumn("p", udf("x1", "x2")).orderBy("x1").collect()
+        assert len(rows) == ROWS
+        np.testing.assert_allclose([r.p for r in rows], expected, rtol=1e-9)
+    assert runtime.driver_stats(connect_spark)["executorCabRpcs"] == "0"
+    _assert_no_executor_minting(managed.server)
+    assert spark_env.gcs.denied() == []
+
+
+def test_connect_sparkxgb_pipelines_udf_load_and_pyfunc(
+    managed: ManagedEnv,
+    connect_spark: Any,
+    spark_env: SparkEnv,
+    sparkxgb_models: Path,
+) -> None:
+    expected_all = json.loads((sparkxgb_models / "expected.json").read_text())
+    inputs = spark_models.with_inputs(_features(connect_spark))
+    local = inputs.orderBy("x1").toPandas()
+    for stage_name, (columns, _) in spark_models.PIPELINES.items():
+        expected = expected_all[stage_name]
+        name = f"{stage_name}-{uuid.uuid4().hex[:6]}"
+        with mlflow.start_run() as run:
+            mlflow.log_artifacts(str(sparkxgb_models / stage_name), stage_name)
+        version = mlflow.register_model(f"runs:/{run.info.run_id}/{stage_name}", name)
+        for uri in (
+            f"runs:/{run.info.run_id}/{stage_name}",
+            f"models:/{name}/{version.version}",
+        ):
+            udf = mlflow.pyfunc.spark_udf(connect_spark, uri)
+            rows = inputs.withColumn("p", udf(*columns)).orderBy("x1").collect()
+            assert len(rows) == ROWS
+            np.testing.assert_allclose([r.p for r in rows], expected, rtol=1e-6)
+            transformer = mlflow.spark.load_model(uri)
+            scored = transformer.transform(inputs).orderBy("x1").collect()
+            np.testing.assert_allclose(
+                [r.prediction for r in scored], expected, rtol=1e-6
+            )
+            predicted = mlflow.pyfunc.load_model(uri).predict(local[columns])
+            np.testing.assert_allclose(
+                np.asarray(predicted).reshape(-1), expected, rtol=1e-6
+            )
+    _assert_workers_never_imported_plugin(spark_env, CONNECT)
+    assert runtime.driver_stats(connect_spark)["executorCabRpcs"] == "0"
+    _assert_no_executor_minting(managed.server)
+    assert spark_env.gcs.denied() == []
 
 
 def test_connect_client_supplier_wraps_and_renews_tokens(
@@ -214,6 +371,7 @@ def test_connect_client_supplier_wraps_and_renews_tokens(
     probe = _assert_client_supplier_round(
         managed.server, recorded, stats, f"{base}/client"
     )
+    # What the Connect plan carries for the exact options the client sent.
     frame = connect_spark.read.format(CONTROL_SOURCE_CLASS).options(**probe).load()
     capsys.readouterr()
     frame.explain(True)
@@ -269,6 +427,7 @@ def test_connect_second_sequential_session(
     second = SparkSession.builder.remote(connect_server.url).create()
     try:
         assert second.session_id != connect_spark.session_id
+        # Session artifacts are isolated: the new session gets its own upload.
         assert runtime.ensure_provider(second) == "add_artifact"
         read_scope = cab.namespace_scope(namespace, write=False, artifact_uri=base)
         path = hooks.cab_path_for(second, f"{base}/data", read_scope)

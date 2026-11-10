@@ -61,19 +61,39 @@ CHUNK = BLOCK - 2 * 32 - 2 - 2
 
 
 def test_mlflow_spark_hooks_are_installed_and_idempotent() -> None:
+    import mlflow.pyfunc
+    import mlflow.pyspark.ml
     import mlflow.spark
 
     for func in (
         mlflow.spark._maybe_save_model,
         mlflow.spark.save_model,
         mlflow.spark.load_model,
+        mlflow.pyspark.ml._read_log_model_allowlist,
+        mlflow.pyspark.ml.autolog,
+        mlflow.pyfunc.load_model,
+        mlflow.pyfunc.spark_udf,
     ):
         assert getattr(func, spark_hooks.PATCH_MARKER, False), func
         assert not getattr(func.__wrapped__, spark_hooks.PATCH_MARKER, False)
     spark_hooks.patch_mlflow_spark(mlflow.spark)
+    spark_hooks.patch_pyspark_ml(mlflow.pyspark.ml)
+    spark_hooks.patch_pyfunc(mlflow.pyfunc)
     assert not getattr(
         mlflow.spark.load_model.__wrapped__, spark_hooks.PATCH_MARKER, False
     )
+
+
+def test_allowlist_works_without_active_spark_session_and_includes_xgboost(
+    managed: ManagedEnv,
+) -> None:
+    import mlflow.pyspark.ml
+
+    assert runtime.active_session() is None
+    allowlist = mlflow.pyspark.ml._read_log_model_allowlist()
+    assert "xgboost.spark.*" in allowlist
+    assert "pyspark.ml.classification.LogisticRegressionModel" in allowlist
+    assert managed.tracking_uri
 
 
 def test_reimporting_plugin_does_not_duplicate_finders() -> None:
@@ -198,6 +218,7 @@ def test_wheel_bundles_identical_jar(built_wheel: Path) -> None:
     with zipfile.ZipFile(built_wheel) as archive:
         member = f"google_cloud_managed_mlflow/jars/{JAR_NAME}"
         assert member in archive.namelist()
+        assert "google_cloud_managed_mlflow/spark/_udf_worker.py" in archive.namelist()
         assert "google_cloud_managed_mlflow/py.typed" in archive.namelist()
         bundled = hashlib.sha256(archive.read(member)).hexdigest()
         entry_points = archive.read(

@@ -38,7 +38,7 @@ The plugin bundles `mlflow-gcs-cab-provider.jar` (`google_cloud_managed_mlflow.s
 - **Spark Connect**: Uploaded automatically on demand via `SparkSession.addArtifacts(bundled_jar_path())`.
 - **Dataproc Serverless Batch & GCE**: Pass `--jars $(python -c "from google_cloud_managed_mlflow.spark import bundled_jar_path; print(bundled_jar_path())")` and `--conf spark.plugins=com.google.cloud.mlflow.gcs.MlflowCabSparkPlugin`.
 
-When a Managed MLflow tracking or registry URI is configured, `mlflow.spark.log_model`, `mlflow.spark.save_model`, and `mlflow.spark.load_model` transparently route Spark model reads and writes through `mlflow-gs://` using driver-minted (or RSA-OAEP client-supplied) Credential Access Boundary (CAB) tokens broadcast to executors.
+When a Managed MLflow tracking or registry URI is configured, `mlflow.spark.log_model`, `mlflow.spark.save_model`, `mlflow.spark.load_model`, `mlflow.pyspark.ml.autolog`, `mlflow.pyfunc.load_model`, and `mlflow.pyfunc.spark_udf` transparently route Spark model reads, writes, and distributed UDF execution through `mlflow-gs://` using driver-minted (or RSA-OAEP client-supplied) Credential Access Boundary (CAB) tokens broadcast to executors.
 
 ## Contributing
 

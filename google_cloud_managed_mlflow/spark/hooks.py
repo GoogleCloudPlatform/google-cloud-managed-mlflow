@@ -673,8 +673,25 @@ def _download_dir(entry: StagedPrefix, dst: str) -> None:
                 shutil.copy2(source, target)
 
 
+def _connect_python_pipeline(spark: Any, location: ModelLocation, meta: Any) -> Any:
+    """Decoded pipeline for Python-stage models on Spark Connect, else None."""
+    if not runtime.is_spark_connect(spark):
+        return None
+    from google_cloud_managed_mlflow.spark import udf as managed_udf
+
+    data_uri, stages = managed_udf.read_pipeline_stages(location, meta)
+    if not managed_udf.has_python_stages(stages):
+        return None
+    return managed_udf.decode_xgboost_pipeline(data_uri, location, stages)
+
+
 def load_spark_model(model_uri: str, location: ModelLocation) -> Any:
-    """Load a Spark model directly from CAB-governed storage (no local weights)."""
+    """Load a Spark model directly from CAB-governed storage (no local weights).
+
+    On Spark Connect, pipelines with Python-only stages (``SparkXGB*``, whose
+    readers require a ``SparkContext``) load as a transformer that evaluates the
+    decoded pipeline with a pandas UDF and appends the prediction column.
+    """
     from mlflow.utils.class_utils import _get_class_from_string
 
     model = read_mlmodel(location)
@@ -687,6 +704,11 @@ def load_spark_model(model_uri: str, location: ModelLocation) -> Any:
             "pyspark.ml.connect models are stored locally and are not supported here.",
             error_code=INTERNAL_ERROR,
         )
+    decoded = _connect_python_pipeline(spark, location, model)
+    if decoded is not None:
+        from google_cloud_managed_mlflow.spark import udf as managed_udf
+
+        return managed_udf.connect_pipeline_model(decoded)
     path = cab_path_for(spark, f"{location.gcs_uri}/{model_data}", location.read_scope)
     try:
         from pyspark.ml.pipeline import PipelineModel
@@ -704,6 +726,237 @@ def load_spark_model(model_uri: str, location: ModelLocation) -> Any:
             f"{cab.redact(str(exc))[:800]}",
             error_code=INTERNAL_ERROR,
         ) from None
+
+
+# ---------------------------------------------------------------- mlflow.pyspark.ml
+
+XGBOOST_ALLOWLIST_ENTRIES = (
+    "xgboost.spark.*",
+    "xgboost.spark.core.SparkXGBClassifierModel",
+    "xgboost.spark.core.SparkXGBRegressorModel",
+    "xgboost.spark.core.SparkXGBRankerModel",
+    "xgboost.spark.estimator.SparkXGBClassifierModel",
+    "xgboost.spark.estimator.SparkXGBRegressorModel",
+    "xgboost.spark.estimator.SparkXGBRankerModel",
+)
+
+
+def patch_pyspark_ml(module: types.ModuleType) -> None:
+    """Install hooks on ``mlflow.pyspark.ml`` (idempotent)."""
+    target: Any = module
+    original_allowlist = module._read_log_model_allowlist
+    if not _is_patched(original_allowlist):
+
+        @functools.wraps(original_allowlist)
+        def _read_log_model_allowlist() -> Any:
+            if not is_managed_context():
+                return original_allowlist()
+            import importlib.resources
+
+            builtin = importlib.resources.files(module.__name__).joinpath(
+                "log_model_allowlist.txt"
+            )
+            spark = runtime.active_session()
+            custom = None
+            if spark is not None:
+                try:
+                    custom = spark.conf.get(
+                        "spark.mlflow.pysparkml.autolog.logModelAllowlistFile", None
+                    )
+                except Exception:
+                    custom = None
+            allowlist: set[str]
+            with importlib.resources.as_file(builtin) as builtin_path:
+                try:
+                    allowlist = set(
+                        module._read_log_model_allowlist_from_file(
+                            custom or builtin_path.as_posix()
+                        )
+                    )
+                except Exception:
+                    _logger.exception(
+                        "Reading allowlist %s failed; using built-in.", custom
+                    )
+                    allowlist = set(
+                        module._read_log_model_allowlist_from_file(
+                            builtin_path.as_posix()
+                        )
+                    )
+            allowlist.update(XGBOOST_ALLOWLIST_ENTRIES)
+            return allowlist
+
+        target._read_log_model_allowlist = _mark(
+            _read_log_model_allowlist, original_allowlist
+        )
+
+    original_autolog = module.autolog
+    if not _is_patched(original_autolog):
+        import inspect
+
+        autolog_signature = inspect.signature(original_autolog)
+
+        @functools.wraps(original_autolog)
+        def autolog(*args: Any, **kwargs: Any) -> Any:
+            result = original_autolog(*args, **kwargs)
+            try:
+                bound = autolog_signature.bind_partial(*args, **kwargs)
+                disable = bool(bound.arguments.get("disable", False))
+            except TypeError:
+                disable = False
+            if not disable:
+                _guard_estimator_fits()
+            return result
+
+        target.autolog = _mark(autolog, original_autolog)
+
+
+def _all_estimator_classes() -> list[type]:
+    from pyspark.ml.base import Estimator
+
+    seen: list[type] = [Estimator]
+    stack: list[type] = [Estimator]
+    while stack:
+        cls = stack.pop()
+        for sub in cls.__subclasses__():
+            if sub not in seen:
+                seen.append(sub)
+                stack.append(sub)
+    return seen
+
+
+def _guard_estimator_fits() -> None:
+    """Wrap autolog-patched ``fit`` methods to protect caller-owned caches.
+
+    MLflow autologging persists the training DataFrame and unpersists it at the
+    end of ``fit``. If the caller had already cached the DataFrame, that would
+    evict the caller's cache; if logging failed midway, the autolog cache would
+    leak. The guard keeps caller caches and always releases autolog-only caches.
+    """
+    for cls in _all_estimator_classes():
+        current = cls.__dict__.get("fit")
+        if current is None or _is_patched(current):
+            continue
+        code = getattr(current, "__code__", None)
+        filename = str(getattr(code, "co_filename", "")).replace(os.sep, "/")
+        if "mlflow/utils/autologging_utils" not in filename:
+            continue
+        guarded: Any = cls
+        guarded.fit = _mark(_make_guarded_fit(current), current)
+
+
+def _make_guarded_fit(patched_fit: Callable[..., Any]) -> Callable[..., Any]:
+    @functools.wraps(patched_fit)
+    def fit(self: Any, dataset: Any, *args: Any, **kwargs: Any) -> Any:
+        if not is_managed_context() or not hasattr(dataset, "is_cached"):
+            return patched_fit(self, dataset, *args, **kwargs)
+        try:
+            was_cached = bool(dataset.is_cached)
+        except Exception:
+            return patched_fit(self, dataset, *args, **kwargs)
+        original_unpersist = dataset.__dict__.get("unpersist")
+        if was_cached:
+            dataset.unpersist = lambda *a, **k: dataset  # keep the caller's cache
+        try:
+            return patched_fit(self, dataset, *args, **kwargs)
+        finally:
+            if was_cached:
+                if original_unpersist is None:
+                    dataset.__dict__.pop("unpersist", None)
+                else:
+                    dataset.unpersist = original_unpersist
+            else:
+                try:
+                    if dataset.is_cached:
+                        dataset.unpersist()
+                except Exception:  # pragma: no cover - best effort cleanup
+                    _logger.debug("Failed to release autolog cache", exc_info=True)
+
+    return fit
+
+
+# --------------------------------------------------------------------- mlflow.pyfunc
+
+
+def patch_pyfunc(module: types.ModuleType) -> None:
+    """Install hooks on ``mlflow.pyfunc`` (idempotent)."""
+    target: Any = module
+    original_load = module.load_model
+    if not _is_patched(original_load):
+
+        @functools.wraps(original_load)
+        def load_model(model_uri: Any, *args: Any, **kwargs: Any) -> Any:
+            uri = str(model_uri)
+            location = resolve_model_location(uri) if _is_remote_uri(uri) else None
+            if location is not None:
+                meta = read_mlmodel(location)
+                if _is_spark_flavor(meta):
+                    return _spark_pyfunc(uri, location, meta)
+            return original_load(model_uri, *args, **kwargs)
+
+        target.load_model = _mark(load_model, original_load)
+
+    original_udf = module.spark_udf
+    if not _is_patched(original_udf):
+
+        @functools.wraps(original_udf)
+        def spark_udf(spark: Any, model_uri: Any, *args: Any, **kwargs: Any) -> Any:
+            uri = str(model_uri)
+            env_manager = kwargs.get("env_manager", args[1] if len(args) > 1 else None)
+            prebuilt = kwargs.get("prebuilt_env_uri")
+            location = (
+                resolve_model_location(uri)
+                if _is_remote_uri(uri)
+                and env_manager in (None, "local")
+                and not prebuilt
+                else None
+            )
+            if location is None:
+                return original_udf(spark, model_uri, *args, **kwargs)
+            from google_cloud_managed_mlflow.spark import udf as managed_udf
+
+            result_type = kwargs.get("result_type", args[0] if args else None)
+            params = kwargs.get("params")
+            model_config = kwargs.get("model_config")
+            meta = read_mlmodel(location)
+            if _is_spark_flavor(meta):
+                return managed_udf.spark_flavor_udf(
+                    spark, uri, location, meta, result_type
+                )
+            return managed_udf.python_flavor_udf(
+                spark, uri, location, meta, result_type, params, model_config
+            )
+
+        target.spark_udf = _mark(spark_udf, original_udf)
+
+
+def _is_remote_uri(uri: str) -> bool:
+    return uri.startswith(("runs:/", "models:/", "gs://"))
+
+
+def _is_spark_flavor(meta: Any) -> bool:
+    pyfunc_conf = meta.flavors.get("python_function", {})
+    return (
+        "spark" in meta.flavors and pyfunc_conf.get("loader_module") == "mlflow.spark"
+    )
+
+
+def _spark_pyfunc(model_uri: str, location: ModelLocation, meta: Any) -> Any:
+    import mlflow.pyfunc
+    import mlflow.spark
+
+    spark = _require_session()
+    decoded = _connect_python_pipeline(spark, location, meta)
+    if decoded is not None:
+        from google_cloud_managed_mlflow.spark import udf as managed_udf
+
+        return mlflow.pyfunc.PyFuncModel(
+            model_meta=meta, model_impl=managed_udf.LocalPipelinePredictor(decoded)
+        )
+    spark_model = load_spark_model(model_uri, location)
+    wrapper = mlflow.spark._PyFuncModelWrapper(
+        spark, spark_model, signature=meta.signature
+    )
+    return mlflow.pyfunc.PyFuncModel(model_meta=meta, model_impl=wrapper)
 
 
 def _patch_artifact_registry(module: types.ModuleType) -> None:
@@ -745,6 +998,8 @@ def install() -> None:
         "mlflow.store.artifact.artifact_repository_registry", _patch_artifact_registry
     )
     when_imported("mlflow.spark", patch_mlflow_spark)
+    when_imported("mlflow.pyspark.ml", patch_pyspark_ml)
+    when_imported("mlflow.pyfunc", patch_pyfunc)
 
 
 install()
