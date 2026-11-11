@@ -17,9 +17,11 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import unittest.mock
+from pathlib import Path
 from typing import Any
 
 import mlflow
@@ -95,7 +97,7 @@ def _make_mock_response(
 
 def test_build_registry_store_gcp_uri() -> None:
     store = build_registry_store(_GCP_REGISTRY_URI, tracking_uri=_GCP_TRACKING_URI)
-    assert isinstance(store, GcpModelRegistryRestStore)
+    assert isinstance(store, rs_mod.GcpModelRegistryRestStore)
     assert store.store_uri == _GCP_REGISTRY_URI
     assert store.tracking_uri == _GCP_TRACKING_URI
     assert (
@@ -815,7 +817,14 @@ def test_lazy_import_isolation() -> None:
             "print('OK')"
         ),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    repo_root = str(Path(__file__).resolve().parent.parent)
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        check=True,
+        env={**os.environ, "PYTHONPATH": repo_root},
+    )
     assert proc.stdout.strip() == "OK"
 
 
@@ -872,13 +881,17 @@ def test_normalize_get_model_version_download_uri() -> None:
 
 
 def test_reset_registry_store_cache() -> None:
-    cls1 = rs_mod._get_registry_store_cls()
-    assert rs_mod._REGISTRY_STORE_CLS is cls1
-    reset_registry_store_cache()
-    assert rs_mod._REGISTRY_STORE_CLS is None
-    cls2 = rs_mod._get_registry_store_cls()
-    assert cls2 is not None
-    assert rs_mod._REGISTRY_STORE_CLS is cls2
+    orig = rs_mod._REGISTRY_STORE_CLS
+    try:
+        cls1 = rs_mod._get_registry_store_cls()
+        assert rs_mod._REGISTRY_STORE_CLS is cls1
+        reset_registry_store_cache()
+        assert rs_mod._REGISTRY_STORE_CLS is None
+        cls2 = rs_mod._get_registry_store_cls()
+        assert cls2 is not None
+        assert rs_mod._REGISTRY_STORE_CLS is cls2
+    finally:
+        rs_mod._REGISTRY_STORE_CLS = orig
 
 
 def test_normalize_last_updated_time_precedence_over_update_time() -> None:

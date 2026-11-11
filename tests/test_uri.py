@@ -965,7 +965,7 @@ def test_build_gcp_api_url_subpath_rejections(bad_subpath: str) -> None:
 @pytest.mark.parametrize(
     ("bad_resource_name", "verb"),
     [
-        # Mantis reproduction 1: verb override via query injection in resource_name
+        # Verb override via query injection in resource_name
         (
             (
                 "projects/p/locations/l/registries/r/registeredModels/m:"
@@ -1050,7 +1050,7 @@ def test_build_gcp_resource_url_security_validations(
 @pytest.mark.parametrize(
     ("bad_suffix", "verb", "subpath"),
     [
-        # Mantis reproduction: query injection in suffix with subpath or verb
+        # Query injection in suffix with subpath or verb
         ("?pageToken=abc", "search", "experiments"),
         ("?pageToken=abc", "search", None),
         ("?pageToken=abc", None, "experiments"),

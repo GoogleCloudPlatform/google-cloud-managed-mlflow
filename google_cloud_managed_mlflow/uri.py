@@ -17,8 +17,11 @@
 from __future__ import annotations
 
 import datetime
+import logging
+import os
 import re
 import urllib.parse
+from collections.abc import Callable
 from typing import Any, NamedTuple
 
 import requests
@@ -48,6 +51,8 @@ from google_cloud_managed_mlflow._validation import (
     _parse_validated_endpoint_url,
 )
 from google_cloud_managed_mlflow.auth import validate_transport_security
+
+_logger = logging.getLogger(__name__)
 
 _PATH_PATTERN = re.compile(
     r"^/(?P<api_version>v1alpha|v1)"
@@ -1086,3 +1091,60 @@ def raise_for_aip193_error(response: requests.Response) -> None:
         error_code=error_code,
         error_info_reason=error_info_reason,
     )
+
+
+def _effective_uri(
+    explicit: str | None,
+    mlflow_getter: Callable[[], str | None],
+    env_var: str,
+) -> str:
+    if explicit:
+        return explicit
+    try:
+        uri_val = mlflow_getter()
+        if uri_val:
+            return uri_val
+    except Exception:
+        _logger.debug("MLflow URI lookup failed; using %s.", env_var, exc_info=True)
+    return os.environ.get(env_var, "")
+
+
+def get_effective_tracking_uri(tracking_uri: str | None = None) -> str:
+    """Return explicit tracking_uri, mlflow.get_tracking_uri(), or env var."""
+    import mlflow
+
+    return _effective_uri(
+        tracking_uri, lambda: mlflow.get_tracking_uri(), "MLFLOW_TRACKING_URI"
+    )
+
+
+def get_effective_registry_uri(registry_uri: str | None = None) -> str:
+    """Return explicit registry_uri, mlflow.get_registry_uri(), or env var."""
+    import mlflow
+
+    return _effective_uri(
+        registry_uri, lambda: mlflow.get_registry_uri(), "MLFLOW_REGISTRY_URI"
+    )
+
+
+def resolve_effective_registry_uri(
+    registry_uri: str | None,
+    effective_tracking_uri: str,
+) -> str:
+    """Return explicit/configured registry URI, falling back to tracking URI.
+
+    Note: ``mlflow.get_registry_uri()`` cannot be called directly here because
+    it falls back to the global tracking URI, which would mask a per-call
+    ``tracking_uri`` passed explicitly by the caller.
+    """
+    import mlflow.tracking._model_registry.utils as mr_utils
+
+    if registry_uri or os.environ.get("MLFLOW_REGISTRY_URI"):
+        return get_effective_registry_uri(registry_uri)
+    ctx_fn = getattr(mr_utils, "_get_registry_uri_from_context", None)
+    explicit_ctx_uri = (ctx_fn() if callable(ctx_fn) else None) or getattr(
+        mr_utils, "_registry_uri", None
+    )
+    if explicit_ctx_uri and isinstance(explicit_ctx_uri, str):
+        return explicit_ctx_uri
+    return effective_tracking_uri

@@ -48,16 +48,43 @@ _logger = logging.getLogger(__name__)
 CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 AUTH_PROVIDER_NAME = "google-cloud-auth"
 
+AUTH_MODE_ENV_VAR = "GOOGLE_CLOUD_MANAGED_MLFLOW_AUTH_MODE"
+AUTH_MODE_AUTO = "auto"
+AUTH_MODE_CAB = "cab"
+AUTH_MODE_EUC = "euc"
+VALID_AUTH_MODES: frozenset[str] = frozenset(
+    {AUTH_MODE_AUTO, AUTH_MODE_CAB, AUTH_MODE_EUC}
+)
+
+
+def parse_auth_mode() -> str:
+    """Return the validated auth mode configured in the environment."""
+    mode = os.environ.get(AUTH_MODE_ENV_VAR, AUTH_MODE_AUTO).strip().lower()
+    if mode not in VALID_AUTH_MODES:
+        raise MlflowException(
+            f"Invalid {AUTH_MODE_ENV_VAR} '{mode}'. "
+            f"Expected one of: {', '.join(sorted(VALID_AUTH_MODES))}.",
+            error_code=INVALID_PARAMETER_VALUE,
+        )
+    return mode
+
+
 __all__ = [
+    "AUTH_MODE_AUTO",
+    "AUTH_MODE_CAB",
+    "AUTH_MODE_ENV_VAR",
+    "AUTH_MODE_EUC",
     "AUTH_PROVIDER_NAME",
     "CLOUD_PLATFORM_SCOPE",
     "CredentialsProtocol",
     "GoogleCloudAuthProvider",
     "GoogleCloudBearerAuth",
+    "VALID_AUTH_MODES",
     "create_secure_session",
     "ensure_auth_provider_registered",
     "harden_mlflow_request_session",
     "is_truthy_env",
+    "parse_auth_mode",
     "validate_transport_security",
 ]
 

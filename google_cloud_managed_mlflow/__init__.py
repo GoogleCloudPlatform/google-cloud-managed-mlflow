@@ -34,69 +34,67 @@ if TYPE_CHECKING:
         is_truthy_env as is_truthy_env,
         validate_transport_security as validate_transport_security,
     )
+    from google_cloud_managed_mlflow.gcs_artifact_repo import (
+        GcpGCSArtifactRepository as GcpGCSArtifactRepository,
+        ensure_artifact_repo_registered as ensure_artifact_repo_registered,
+    )
+    from google_cloud_managed_mlflow.models_artifact_repo import (
+        GcpModelsArtifactRepository as GcpModelsArtifactRepository,
+    )
     from google_cloud_managed_mlflow.registry_store import (
-        GcpModelRegistryRestStore,
-        build_registry_store,
-        ensure_registry_store_registered,
+        GcpModelRegistryRestStore as GcpModelRegistryRestStore,
+        build_registry_store as build_registry_store,
+        ensure_registry_store_registered as ensure_registry_store_registered,
     )
     from google_cloud_managed_mlflow.tracking_store import (
         GcpTrackingRestStore as GcpTrackingRestStore,
         build_tracking_store as build_tracking_store,
+        ensure_tracking_store_registered as ensure_tracking_store_registered,
     )
 
 __all__ = [
     "__version__",
+    "GcpGCSArtifactRepository",
     "GcpModelRegistryRestStore",
+    "GcpModelsArtifactRepository",
     "GcpTrackingRestStore",
     "build_registry_store",
     "build_tracking_store",
+    "ensure_artifact_repo_registered",
     "ensure_registry_store_registered",
+    "ensure_tracking_store_registered",
 ]
 
-_REGISTRY_EXPORTS = frozenset(
-    {
-        "GcpModelRegistryRestStore",
-        "build_registry_store",
-        "ensure_registry_store_registered",
-    }
-)
-
-_TRACKING_EXPORTS = frozenset(
-    {
-        "GcpTrackingRestStore",
-        "build_tracking_store",
-    }
-)
-
-_AUTH_EXPORTS = frozenset(
-    {
-        "AUTH_PROVIDER_NAME",
-        "CLOUD_PLATFORM_SCOPE",
-        "CredentialsProtocol",
-        "GoogleCloudAuthProvider",
-        "GoogleCloudBearerAuth",
-        "create_secure_session",
-        "ensure_auth_provider_registered",
-        "harden_mlflow_request_session",
-        "is_truthy_env",
-        "validate_transport_security",
-    }
-)
+_LAZY_EXPORTS: dict[str, str] = {
+    "GcpGCSArtifactRepository": "gcs_artifact_repo",
+    "ensure_artifact_repo_registered": "gcs_artifact_repo",
+    "GcpModelsArtifactRepository": "models_artifact_repo",
+    "GcpModelRegistryRestStore": "registry_store",
+    "build_registry_store": "registry_store",
+    "ensure_registry_store_registered": "registry_store",
+    "GcpTrackingRestStore": "tracking_store",
+    "build_tracking_store": "tracking_store",
+    "ensure_tracking_store_registered": "tracking_store",
+    "AUTH_PROVIDER_NAME": "auth",
+    "CLOUD_PLATFORM_SCOPE": "auth",
+    "CredentialsProtocol": "auth",
+    "GoogleCloudAuthProvider": "auth",
+    "GoogleCloudBearerAuth": "auth",
+    "create_secure_session": "auth",
+    "ensure_auth_provider_registered": "auth",
+    "harden_mlflow_request_session": "auth",
+    "is_truthy_env": "auth",
+    "validate_transport_security": "auth",
+}
 
 
 def __getattr__(name: str) -> Any:
-    if name.startswith("__"):
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    if name in _REGISTRY_EXPORTS:
-        from google_cloud_managed_mlflow import registry_store as registry_store_mod
-
-        return getattr(registry_store_mod, name)
-    if name in _TRACKING_EXPORTS:
-        tracking_store_mod = importlib.import_module(
-            "google_cloud_managed_mlflow.tracking_store"
-        )
-        return getattr(tracking_store_mod, name)
-    if name in _AUTH_EXPORTS:
-        auth_mod = importlib.import_module("google_cloud_managed_mlflow.auth")
-        return getattr(auth_mod, name)
+    submodule = _LAZY_EXPORTS.get(name)
+    if submodule is not None:
+        mod = importlib.import_module(f"{__name__}.{submodule}")
+        return getattr(mod, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(__all__) | set(_LAZY_EXPORTS))

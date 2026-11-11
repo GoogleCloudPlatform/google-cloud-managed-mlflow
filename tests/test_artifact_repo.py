@@ -43,6 +43,7 @@ from google_cloud_managed_mlflow.cab_credentials import (
     CabAccessMode,
     CabResourceKind,
     CabTokenCredentials,
+    reset_cab_credentials_cache,
 )
 from google_cloud_managed_mlflow.gcs_artifact_repo import (
     AUTH_MODE_ENV_VAR,
@@ -74,6 +75,7 @@ def _isolate_plugin_state(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(mr_utils, "_registry_uri", None, raising=True)
     monkeypatch.setattr(tr_utils, "_tracking_uri", None, raising=True)
+    reset_cab_credentials_cache()
 
 
 def _make_mock_gcs_client() -> unittest.mock.MagicMock:
@@ -236,7 +238,7 @@ class TestEntryPointAndInit:
         super_init = _stub_super_init(monkeypatch)
 
         repo = GcpGCSArtifactRepository(
-            "gs://my-bucket/models/123/artifacts/MLmodel",
+            "gs://my-bucket/unmatched/artifacts/MLmodel",
             tracking_uri="http://localhost:5000",
             registry_uri=_GCP_REGISTRY_URI,
         )
@@ -248,7 +250,7 @@ class TestEntryPointAndInit:
         # Omitted tracking URI with GCP registry URI also yields stock repository
         super_init.reset_mock()
         repo2 = GcpGCSArtifactRepository(
-            "gs://my-bucket/models/123/artifacts/MLmodel",
+            "gs://my-bucket/unmatched/artifacts/MLmodel",
             registry_uri=_GCP_REGISTRY_URI,
         )
         assert repo2._cab_credentials is None
@@ -284,16 +286,15 @@ class TestEntryPointAndInit:
             unittest.mock.patch.dict(os.environ, env),
             pytest.raises(
                 MlflowException,
-                match=r"requires a Managed (?:Service for )?MLflow namespace",
+                match=r"cannot resolve CAB credentials for artifact URI",
             ) as exc_info,
         ):
             GcpGCSArtifactRepository(
-                "gs://my-bucket/models/123/artifacts/MLmodel",
+                "gs://my-bucket/unmatched/artifacts/MLmodel",
                 **{"tracking_uri": "http://localhost:5000", **kwargs},
             )
         assert exc_info.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
-        assert "requires a Managed" in str(exc_info.value)
-        assert "namespace" in str(exc_info.value)
+        assert "cannot resolve CAB credentials" in str(exc_info.value)
 
     def test_cab_mode_non_managed_registry_uri_does_not_raise(
         self, monkeypatch: pytest.MonkeyPatch
@@ -431,10 +432,11 @@ class TestEntryPointAndInit:
 
         with pytest.raises(
             MlflowException,
-            match=r"requires a Managed (?:Service for )?MLflow namespace",
+            match=r"cannot resolve CAB credentials for artifact URI",
         ) as exc_info:
             GcpGCSArtifactRepository(_ARTIFACT_URI, tracking_uri="http://non-gcp-uri")
         assert exc_info.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
+        assert "cannot resolve CAB credentials" in str(exc_info.value)
 
     def test_init_super_var_keyword_signature_passes_all_kwargs(
         self, monkeypatch: pytest.MonkeyPatch
@@ -467,6 +469,8 @@ class TestEntryPointAndInit:
     def test_effective_tracking_uri_falls_back_to_env_when_mlflow_raises(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
+        from google_cloud_managed_mlflow import uri as uri_mod
+
         monkeypatch.setenv("MLFLOW_TRACKING_URI", _GCP_TRACKING_URI)
         import mlflow
 
@@ -476,12 +480,12 @@ class TestEntryPointAndInit:
             "get_tracking_uri",
             unittest.mock.Mock(side_effect=error),
         )
-        with caplog.at_level(logging.DEBUG, logger=repo_mod.__name__):
-            assert repo_mod._get_effective_tracking_uri(None) == _GCP_TRACKING_URI
+        with caplog.at_level(logging.DEBUG, logger=uri_mod.__name__):
+            assert uri_mod.get_effective_tracking_uri(None) == _GCP_TRACKING_URI
         debug_records = [
             r
             for r in caplog.records
-            if r.name == repo_mod.__name__
+            if r.name == uri_mod.__name__
             and r.levelno == logging.DEBUG
             and r.exc_info
             and r.exc_info[1] is error
@@ -491,6 +495,8 @@ class TestEntryPointAndInit:
     def test_effective_registry_uri_falls_back_to_env_when_mlflow_raises(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
+        from google_cloud_managed_mlflow import uri as uri_mod
+
         monkeypatch.setenv("MLFLOW_REGISTRY_URI", _GCP_REGISTRY_URI)
         import mlflow
 
@@ -500,12 +506,12 @@ class TestEntryPointAndInit:
             "get_registry_uri",
             unittest.mock.Mock(side_effect=error),
         )
-        with caplog.at_level(logging.DEBUG, logger=repo_mod.__name__):
-            assert repo_mod._get_effective_registry_uri(None) == _GCP_REGISTRY_URI
+        with caplog.at_level(logging.DEBUG, logger=uri_mod.__name__):
+            assert uri_mod.get_effective_registry_uri(None) == _GCP_REGISTRY_URI
         debug_records = [
             r
             for r in caplog.records
-            if r.name == repo_mod.__name__
+            if r.name == uri_mod.__name__
             and r.levelno == logging.DEBUG
             and r.exc_info
             and r.exc_info[1] is error
@@ -1282,6 +1288,114 @@ class TestAuthModesAndFallback:
             )
         assert repo._cab_credentials is not None
 
+    def test_concurrent_adc_switch_does_not_retry_non_fallback_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When repo was already switched to ADC concurrently and fn() raises
+        a non-fallback error, fn() is NOT retried and the original error propagates.
+        """
+        _stub_super_init(monkeypatch)
+        cab_client = _make_mock_gcs_client()
+        with unittest.mock.patch(
+            "google_cloud_managed_mlflow.gcs_artifact_repo.gcs_storage.Client",
+            return_value=cab_client,
+        ):
+            repo = GcpGCSArtifactRepository(
+                _ARTIFACT_URI, tracking_uri=_GCP_TRACKING_URI
+            )
+        repo.artifact_uri = _ARTIFACT_URI
+        assert repo._cab_credentials is not None
+        calls = 0
+
+        def op() -> str:
+            nonlocal calls
+            calls += 1
+            # Simulate another thread switching repo to ADC concurrently
+            # while op() is running
+            repo._switch_to_adc(cause=RuntimeError("concurrent switch"))
+            raise FileNotFoundError("object not found")
+
+        with pytest.raises(FileNotFoundError, match="object not found"):
+            repo._execute_with_cab_fallback(op)
+        assert calls == 1
+        assert repo._cab_credentials is None
+
+    def test_concurrent_adc_switch_retries_fallback_or_closed_creds_error(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """When repo was switched to ADC concurrently while fn() is in flight and
+        fn() raises a fallback error (Forbidden) or closed creds error, fn() retries
+        once under ADC and succeeds with 1 warning total.
+        """
+        _stub_super_init(monkeypatch)
+        cab_client = _make_mock_gcs_client()
+        adc_client = _make_mock_gcs_client()
+        repo_mod.reset_gcs_artifact_repo_state()
+
+        # Case 1: Initial Forbidden error while concurrent switch occurred
+        with unittest.mock.patch(
+            "google_cloud_managed_mlflow.gcs_artifact_repo.gcs_storage.Client",
+            side_effect=[cab_client, adc_client],
+        ):
+            repo_a = GcpGCSArtifactRepository(
+                _ARTIFACT_URI, tracking_uri=_GCP_TRACKING_URI
+            )
+        repo_a.artifact_uri = _ARTIFACT_URI
+        calls_a = 0
+
+        def op_a() -> str:
+            nonlocal calls_a
+            calls_a += 1
+            if calls_a == 1:
+                repo_a._switch_to_adc(cause=RuntimeError("concurrent switch"))
+                repo_a._warn_fallback_once(
+                    "initial_storage_forbidden", RuntimeError("concurrent switch")
+                )
+                raise google.api_core.exceptions.Forbidden("Forbidden on CAB")
+            return "ok-adc-a"
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=repo_mod.__name__):
+            res_a = repo_a._execute_with_cab_fallback(op_a)
+        assert res_a == "ok-adc-a"
+        assert calls_a == 2
+        # Switch already warned during concurrent switch; no duplicate warning
+        warnings_a = _repo_warnings(caplog)
+        assert len(warnings_a) == 1
+
+        # Case 2: In-flight refresh failed because creds was closed by concurrent switch
+        repo_mod.reset_gcs_artifact_repo_state()
+        with unittest.mock.patch(
+            "google_cloud_managed_mlflow.gcs_artifact_repo.gcs_storage.Client",
+            side_effect=[cab_client, adc_client],
+        ):
+            repo_b = GcpGCSArtifactRepository(
+                _ARTIFACT_URI, tracking_uri=_GCP_TRACKING_URI
+            )
+        repo_b.artifact_uri = _ARTIFACT_URI
+        initial_creds = repo_b._cab_credentials
+        assert initial_creds is not None
+        calls_b = 0
+
+        def op_b() -> str:
+            nonlocal calls_b
+            calls_b += 1
+            if calls_b == 1:
+                repo_b._switch_to_adc(cause=RuntimeError("concurrent switch"))
+                repo_b._warn_fallback_once(
+                    "initial_storage_forbidden", RuntimeError("concurrent switch")
+                )
+                initial_creds.refresh(unittest.mock.MagicMock())
+            return "ok-adc-b"
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=repo_mod.__name__):
+            res_b = repo_b._execute_with_cab_fallback(op_b)
+        assert res_b == "ok-adc-b"
+        assert calls_b == 2
+        warnings_b = _repo_warnings(caplog)
+        assert len(warnings_b) == 1
+
 
 class TestArtifactOperations:
     """Tests for delete_artifacts, multipart guards, and Path inputs."""
@@ -1699,6 +1813,11 @@ class TestArtifactOperations:
             "google_cloud_managed_mlflow.gcs_artifact_repo",
             id="gcs_artifact_repo",
         ),
+        pytest.param(
+            "google_cloud_managed_mlflow.models_artifact_repo",
+            id="models_artifact_repo",
+        ),
+        pytest.param("google_cloud_managed_mlflow", id="root_package"),
     ],
 )
 def test_gs_registration_survives_first_import_order(
@@ -1713,7 +1832,9 @@ def test_gs_registration_survives_first_import_order(
     )
     (dist_info / "entry_points.txt").write_text(
         "[mlflow.artifact_repository]\n"
-        "gs = google_cloud_managed_mlflow.gcs_artifact_repo:GcpGCSArtifactRepository\n",
+        "gs = google_cloud_managed_mlflow.gcs_artifact_repo:GcpGCSArtifactRepository\n"
+        "models = google_cloud_managed_mlflow.models_artifact_repo:"
+        "GcpModelsArtifactRepository\n",
         encoding="utf-8",
     )
 
@@ -1725,6 +1846,7 @@ def test_gs_registration_survives_first_import_order(
         import {first_import}
         import mlflow
         from mlflow.store.artifact.artifact_repository_registry import (
+            _artifact_repository_registry,
             get_artifact_repository,
         )
 
@@ -1734,6 +1856,12 @@ def test_gs_registration_survives_first_import_order(
         )
         assert getattr(repo, "_cab_credentials", None) is not None, (
             "Expected _cab_credentials to be initialized"
+        )
+        assert (
+            _artifact_repository_registry.get_registered_artifact_repositories()[
+                "models"
+            ].__name__
+            == "GcpModelsArtifactRepository"
         )
         """
     )

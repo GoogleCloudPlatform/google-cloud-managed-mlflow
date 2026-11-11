@@ -16,8 +16,7 @@
 
 from __future__ import annotations
 
-import contextlib
-import importlib.metadata
+import enum
 import logging
 import os
 import posixpath
@@ -25,63 +24,23 @@ import re
 import sys
 import threading
 import urllib.parse
-import warnings
-from collections.abc import Callable, Iterator
-from typing import TYPE_CHECKING, Any, Final, Literal, TypeVar, cast
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, Final, Literal, TypeVar
 
 import google.api_core.exceptions
 from google.cloud import storage as gcs_storage
 
-_GS_REGISTRATION_WARNING = (
-    r'Failure attempting to register artifact repository for scheme "gs"'
+from google_cloud_managed_mlflow._entrypoint_guard import (
+    quiet_registration_warning,
+    repair_artifact_entrypoint,
 )
-_IMPORTED_BEFORE_MLFLOW = "mlflow" not in sys.modules
+
+_IMPORTED_BEFORE_MLFLOW = (
+    "mlflow.store.artifact.artifact_repository_registry" not in sys.modules
+)
 
 
-@contextlib.contextmanager
-def _quiet_gs_registration_warning() -> Iterator[None]:
-    """Hide MLflow's "gs" registration warning while this module imports mlflow.
-
-    If this module is the first to import mlflow, MLflow loads the "gs" entry
-    point while this module is only partially initialized, warns "Failure
-    attempting to register artifact repository for scheme \"gs\"" (an error under
-    ``-W error``) and keeps its stock class; _ensure_gs_registered() repairs the
-    registration at the bottom of this module. Only the filter added here is
-    removed afterwards. Do not use warnings.catch_warnings(): it restores the
-    whole filter list and would discard filters that mlflow and its
-    dependencies install during their first import.
-    """
-    if "mlflow" in sys.modules:
-        yield
-        return
-    warnings.filterwarnings(
-        "ignore", message=_GS_REGISTRATION_WARNING, category=UserWarning
-    )
-    # With Python 3.14 context-aware warnings inside catch_warnings(), the new
-    # filter goes to a context-local list, so warnings.filters[0] may belong to
-    # someone else. Only remember the entry if it is the one just added.
-    gs_filter: Any = None
-    candidate = warnings.filters[0] if warnings.filters else None
-    if (
-        candidate is not None
-        and candidate[0] == "ignore"
-        and candidate[2] is UserWarning
-        and getattr(candidate[1], "pattern", None) == _GS_REGISTRATION_WARNING
-    ):
-        gs_filter = candidate
-    try:
-        yield
-    finally:
-        if gs_filter is not None:
-            # Remove by identity so that an equal filter added by others survives.
-            filters = cast("list[Any]", warnings.filters)
-            for index, item in enumerate(filters):
-                if item is gs_filter:
-                    del filters[index]
-                    break
-
-
-with _quiet_gs_registration_warning():
+with quiet_registration_warning():
     from mlflow.exceptions import (
         MlflowException,
         _UnsupportedMultipartUploadException,
@@ -99,16 +58,37 @@ with _quiet_gs_registration_warning():
 # itself imported first, MLflow cannot see the class yet; _ensure_gs_registered()
 # at the bottom of this module repairs that case.
 if TYPE_CHECKING:
+    from google_cloud_managed_mlflow.auth import (
+        AUTH_MODE_AUTO as AUTH_MODE_AUTO,
+        AUTH_MODE_CAB as AUTH_MODE_CAB,
+        AUTH_MODE_ENV_VAR as AUTH_MODE_ENV_VAR,
+        AUTH_MODE_EUC as AUTH_MODE_EUC,
+    )
     from google_cloud_managed_mlflow.cab_credentials import (
         CabAccessMode,
         CabTokenCredentials,
+        RegisteredModelGcsMatch,
     )
 
-AUTH_MODE_ENV_VAR = "GOOGLE_CLOUD_MANAGED_MLFLOW_AUTH_MODE"
-AUTH_MODE_AUTO = "auto"
-AUTH_MODE_CAB = "cab"
-AUTH_MODE_EUC = "euc"
-_SUPPORTED_AUTH_MODES = frozenset({AUTH_MODE_AUTO, AUTH_MODE_CAB, AUTH_MODE_EUC})
+_AUTH_MODE_ATTRS: Final[frozenset[str]] = frozenset(
+    {"AUTH_MODE_AUTO", "AUTH_MODE_CAB", "AUTH_MODE_ENV_VAR", "AUTH_MODE_EUC"}
+)
+
+
+class _Unset(enum.Enum):
+    TOKEN = "UNSET"
+
+
+_UNSET: Final = _Unset.TOKEN
+
+
+def __getattr__(name: str) -> Any:
+    if name in _AUTH_MODE_ATTRS:
+        from google_cloud_managed_mlflow import auth
+
+        return getattr(auth, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 # Lowercase fragments of issue*ArtifactToken error messages, matched against
 # str(exc).lower() by _fallback_reason. Message matching is a stopgap until the
@@ -151,6 +131,7 @@ _FallbackReason = Literal[
     "token_rpc_unavailable",
     "storage_root_containment",
     "initial_storage_forbidden",
+    "unsupported_model_id_for_cab",
 ]
 
 _SERVICE_AGENT_BUCKET_HINT = (
@@ -161,7 +142,11 @@ _SERVICE_AGENT_BUCKET_HINT = (
 # The bucket-access hint only helps when the service agent is in play; it is
 # noise when the token RPC is unavailable or the URI is outside the root.
 _REASONS_WITHOUT_BUCKET_HINT: frozenset[_FallbackReason] = frozenset(
-    {"token_rpc_unavailable", "storage_root_containment"}
+    {
+        "token_rpc_unavailable",
+        "storage_root_containment",
+        "unsupported_model_id_for_cab",
+    }
 )
 
 logger = logging.getLogger(__name__)
@@ -183,8 +168,33 @@ _NAMESPACE_RUN_OR_MODEL_URI_RE: Final[re.Pattern[str]] = re.compile(
 )
 
 
+def _warn_cab_fallback_once(
+    endpoint_target: str,
+    bucket_name: str,
+    reason: _FallbackReason,
+    cause: BaseException,
+) -> None:
+    """Warn once per (endpoint_target, bucket_name) across the process."""
+    with _WARNING_LOCK:
+        if (endpoint_target, bucket_name) in _WARNED_FALLBACK_TARGETS:
+            return
+        _bounded_add(_WARNED_FALLBACK_TARGETS, (endpoint_target, bucket_name))
+    hint = "" if reason in _REASONS_WITHOUT_BUCKET_HINT else _SERVICE_AGENT_BUCKET_HINT
+    logger.warning(
+        "Google Cloud Managed Service for MLflow: using Application Default "
+        "Credentials for bucket '%s' because scoped (CAB) credentials could "
+        "not be used (%s: %s).%s",
+        bucket_name,
+        reason,
+        cause,
+        hint,
+    )
+
+
 def _warn_cab_inactive_once(effective_tracking_uri: str) -> None:
     """Log a one-time warning in cab mode when CAB is inactive."""
+    from google_cloud_managed_mlflow.auth import AUTH_MODE_ENV_VAR
+
     with _WARNED_CAB_INACTIVE_LOCK:
         if effective_tracking_uri in _WARNED_CAB_INACTIVE_URIS:
             return
@@ -228,6 +238,11 @@ def _fallback_reason(
     if isinstance(exc, google.api_core.exceptions.Forbidden):
         return None if cab_storage_succeeded else "initial_storage_forbidden"
 
+    from google_cloud_managed_mlflow.cab_credentials import UnsupportedCabModelIdError
+
+    if isinstance(exc, UnsupportedCabModelIdError):
+        return "unsupported_model_id_for_cab"
+
     from google_cloud_managed_mlflow.uri import GcpMlflowApiError
 
     if not isinstance(exc, GcpMlflowApiError):
@@ -270,54 +285,21 @@ def _is_object_key_within_path(object_key: str, path: str) -> bool:
     return object_key == path or object_key.startswith(f"{path}/")
 
 
-def _effective_uri(
-    explicit: str | None, mlflow_getter: Callable[[], str | None], env_var: str
-) -> str:
-    """Return ``explicit``, else ``mlflow_getter()``, else the ``env_var`` value.
-
-    The MLflow getter also honors mlflow.set_*_uri(). If it raises, the error is
-    logged at DEBUG level and the environment variable is used instead.
-    """
-    if explicit:
-        return explicit
-    try:
-        resolved = mlflow_getter()
-        if resolved:
-            return resolved
-    except Exception:
-        logger.debug("MLflow URI lookup failed; using %s.", env_var, exc_info=True)
-    return os.environ.get(env_var, "")
-
-
-def _get_effective_tracking_uri(tracking_uri: str | None) -> str:
-    import mlflow
-
-    return _effective_uri(
-        tracking_uri, lambda: mlflow.get_tracking_uri(), "MLFLOW_TRACKING_URI"
-    )
-
-
-def _get_effective_registry_uri(registry_uri: str | None) -> str:
-    import mlflow
-
-    return _effective_uri(
-        registry_uri, lambda: mlflow.get_registry_uri(), "MLFLOW_REGISTRY_URI"
-    )
-
-
 def _extract_namespace_cab_target(
     artifact_uri: str,
 ) -> tuple[str | None, str | None, str | None, str | None]:
     """Extract (target_uri, run_id, model_id, artifact_path) from artifact URI."""
     from google_cloud_managed_mlflow.cab_credentials import (
         derive_cab_directory_uri,
+        strip_mlmodel_leaf,
     )
 
     derived_uri = derive_cab_directory_uri(artifact_uri)
     parsed = urllib.parse.urlsplit(artifact_uri)
-    raw_path = parsed.path.rstrip("/")
-    if not artifact_uri.endswith("/") and raw_path.endswith("/MLmodel"):
-        raw_path = raw_path[: -len("/MLmodel")]
+    rel = parsed.path.strip("/")
+    if not artifact_uri.endswith("/"):
+        rel = strip_mlmodel_leaf(rel).strip("/")
+    raw_path = f"/{rel}" if rel else ""
 
     parsed_derived = urllib.parse.urlsplit(derived_uri)
     derived_path = parsed_derived.path.rstrip("/")
@@ -334,25 +316,94 @@ def _extract_namespace_cab_target(
     return (derived_uri, None, None, None)
 
 
+def _match_registered_model_gcs_uri(
+    artifact_uri: str,
+    tracking_uri: str | None,
+    registry_uri: str | None,
+) -> RegisteredModelGcsMatch | None:
+    """Match a GCS artifact URI to recorded registered model info."""
+    from google_cloud_managed_mlflow.cab_credentials import (
+        is_registered_model_storage_or_parent_uri,
+        lookup_registered_model_for_gcs_uri,
+    )
+    from google_cloud_managed_mlflow.uri import (
+        get_effective_tracking_uri,
+        is_gcp_registry_uri,
+        is_gcp_tracking_uri,
+        parse_gcp_uri,
+    )
+
+    effective_tracking = get_effective_tracking_uri(tracking_uri)
+    prefer_namespace = (
+        registry_uri is None
+        and is_gcp_tracking_uri(effective_tracking)
+        and not is_registered_model_storage_or_parent_uri(artifact_uri)
+    )
+    if prefer_namespace:
+        return None
+    if registry_uri is not None and not is_gcp_registry_uri(registry_uri):
+        return None
+    matched = lookup_registered_model_for_gcs_uri(artifact_uri)
+    if matched is not None and registry_uri is not None:
+        if parse_gcp_uri(registry_uri).resource_url != matched.registry_resource_url:
+            return None
+    return matched
+
+
+def build_registered_model_cab_credentials(
+    *,
+    registry_uri: str,
+    model_name: str,
+    version_root_uri: str,
+    auth_mode: str,
+) -> CabTokenCredentials | None:
+    """Build CAB token credentials for a model with auto-mode fallback."""
+    from google_cloud_managed_mlflow.auth import AUTH_MODE_AUTO
+    from google_cloud_managed_mlflow.cab_credentials import (
+        CabAccessMode,
+        CabResourceKind,
+        CabTokenCredentials,
+        resolve_registered_model_resource_url,
+    )
+
+    try:
+        canonical_url = resolve_registered_model_resource_url(
+            registry_resource_url=registry_uri, model_name=model_name
+        )
+        return CabTokenCredentials(
+            resource_url=canonical_url,
+            resource_kind=CabResourceKind.REGISTERED_MODEL,
+            access_mode=CabAccessMode.READ_ONLY,
+            artifact_uri=version_root_uri,
+            registry_resource_url=registry_uri,
+            model_name=model_name,
+        )
+    except Exception as exc:
+        if auth_mode != AUTH_MODE_AUTO:
+            raise
+        reason = _fallback_reason(exc, cab_storage_succeeded=False)
+        if reason is None:
+            raise
+        bucket_name = urllib.parse.urlsplit(version_root_uri).netloc
+        _warn_cab_fallback_once(registry_uri, bucket_name, reason, exc)
+        return None
+
+
 class GcpGCSArtifactRepository(GCSArtifactRepository):
     """GCS artifact repository for Google Cloud Managed Service for MLflow.
 
-    CAB-downscoped credentials are used only when ``cab_credentials`` is injected
-    or the Managed Service for MLflow namespace resolves from: (1) the explicit
-    ``tracking_uri`` argument, if it is a Managed Service for MLflow namespace URI;
-    (2) ``mlflow.get_tracking_uri()``; (3) the ``MLFLOW_TRACKING_URI``
-    environment variable; otherwise MLflow's stock ADC-backed repository is
-    used, in every mode. Registry URIs never enable CAB.
-    GOOGLE_CLOUD_MANAGED_MLFLOW_AUTH_MODE selects ``auto`` (default: CAB,
-    retried once with ADC when ``_fallback_reason`` allows it), ``cab``
-    (never falls back to ADC once CAB is active; a Managed Service for MLflow
-    registry URI without a namespace tracking URI raises INVALID_PARAMETER_VALUE)
-    or ``euc`` (ADC only). An explicit ``client`` or ``credential_refresh_def``
-    always bypasses CAB.
+    Downscoped Credential Access Boundary (CAB) credentials are used for namespace
+    run/model artifacts and registered models in Google Cloud Managed Service for
+    MLflow. Registered model storage paths are strictly read-only and resolve to
+    RegisteredModel CAB credentials based on recorded download URIs and the model
+    registry resource URL.
 
-    Security note: after an auto-mode fallback the instance uses the caller's
-    ADC for the rest of its lifetime, so neither least privilege nor server-side
-    run-lifecycle enforcement applies to it; only cab mode guarantees both.
+    GOOGLE_CLOUD_MANAGED_MLFLOW_AUTH_MODE selects ``auto`` (default: CAB,
+    retried once with ADC when allowable storage errors occur), ``cab``
+    (never falls back to ADC once CAB is active; unresolvable paths or missing
+    registry credentials fail closed with INVALID_PARAMETER_VALUE) or ``euc``
+    (ADC only). An explicit ``client`` or ``credential_refresh_def`` always
+    bypasses CAB.
     """
 
     def __init__(
@@ -362,19 +413,28 @@ class GcpGCSArtifactRepository(GCSArtifactRepository):
         credential_refresh_def: Any = None,
         tracking_uri: str | None = None,
         registry_uri: str | None = None,
-        cab_credentials: CabTokenCredentials | None = None,
+        cab_credentials: CabTokenCredentials | _Unset | None = _UNSET,
+        is_registered_model: bool = False,
+        *,
+        _auth_mode: str | None = None,
     ) -> None:
-        from google_cloud_managed_mlflow.cab_credentials import CabAccessMode
-
-        self._auth_mode = (
-            os.environ.get(AUTH_MODE_ENV_VAR, AUTH_MODE_AUTO).strip().lower()
+        from google_cloud_managed_mlflow.auth import (
+            AUTH_MODE_EUC,
+            parse_auth_mode,
         )
-        if self._auth_mode not in _SUPPORTED_AUTH_MODES:
-            raise MlflowException(
-                f"Invalid {AUTH_MODE_ENV_VAR} '{self._auth_mode}'. "
-                f"Expected one of: {', '.join(sorted(_SUPPORTED_AUTH_MODES))}.",
-                error_code=INVALID_PARAMETER_VALUE,
-            )
+        from google_cloud_managed_mlflow.cab_credentials import (
+            CabAccessMode,
+            CabResourceKind,
+            is_registered_model_storage_or_parent_uri,
+        )
+
+        self._auth_mode = _auth_mode if _auth_mode is not None else parse_auth_mode()
+        self._is_registered_model = is_registered_model
+
+        if not self._is_registered_model and is_registered_model_storage_or_parent_uri(
+            artifact_uri
+        ):
+            self._is_registered_model = True
 
         self._cab_credentials: CabTokenCredentials | None = None
         self._write_cab_credentials: CabTokenCredentials | None = None
@@ -385,6 +445,21 @@ class GcpGCSArtifactRepository(GCSArtifactRepository):
         self._fallback_lock = threading.Lock()
         self._endpoint_target = ""
 
+        matched_model: RegisteredModelGcsMatch | _Unset | None = _UNSET
+        if cab_credentials is not _UNSET:
+            if (
+                cab_credentials is not None
+                and getattr(cab_credentials, "resource_kind", None)
+                == CabResourceKind.REGISTERED_MODEL
+            ):
+                self._is_registered_model = True
+        elif self._auth_mode != AUTH_MODE_EUC:
+            matched_model = _match_registered_model_gcs_uri(
+                artifact_uri, tracking_uri, registry_uri
+            )
+            if matched_model is not None:
+                self._is_registered_model = True
+
         # An explicit client or refresh hook, or euc mode, keeps MLflow's own
         # credentials; otherwise CAB applies when configured.
         if (
@@ -392,14 +467,20 @@ class GcpGCSArtifactRepository(GCSArtifactRepository):
             and credential_refresh_def is None
             and self._auth_mode != AUTH_MODE_EUC
         ):
-            if cab_credentials is None:
-                cab_credentials = self._namespace_cab_credentials(
-                    artifact_uri, tracking_uri, registry_uri
+            resolved_cab_creds: CabTokenCredentials | None
+            if cab_credentials is _UNSET:
+                resolved_cab_creds = self._resolve_cab_credentials(
+                    artifact_uri,
+                    tracking_uri,
+                    registry_uri,
+                    matched_model=matched_model,
                 )
-            if cab_credentials is not None:
-                self._cab_credentials = cab_credentials
+            else:
+                resolved_cab_creds = cab_credentials
+            if resolved_cab_creds is not None:
+                self._cab_credentials = resolved_cab_creds
                 client = self._attach_cab_client(
-                    cab_credentials, mode=CabAccessMode.READ_ONLY
+                    resolved_cab_creds, mode=CabAccessMode.READ_ONLY
                 )
                 self._read_client = client
 
@@ -413,62 +494,169 @@ class GcpGCSArtifactRepository(GCSArtifactRepository):
         if self._read_client is None:
             self._read_client = getattr(self, "client", client)
 
-    def _namespace_cab_credentials(
+    def _resolve_cab_credentials(
         self,
         artifact_uri: str,
         tracking_uri: str | None,
         registry_uri: str | None = None,
+        matched_model: RegisteredModelGcsMatch | _Unset | None = _UNSET,
     ) -> CabTokenCredentials | None:
-        """Resolve and construct CAB credentials for a namespace, or None."""
+        """Resolve and construct CAB credentials for a namespace or model, or None."""
+        from google_cloud_managed_mlflow.auth import (
+            AUTH_MODE_CAB,
+            AUTH_MODE_ENV_VAR,
+        )
         from google_cloud_managed_mlflow.cab_credentials import (
             CabAccessMode,
             CabResourceKind,
             CabTokenCredentials,
+            RegisteredModelGcsMatch,
+            is_registered_model_storage_or_parent_uri,
         )
         from google_cloud_managed_mlflow.uri import (
+            get_effective_registry_uri,
+            get_effective_tracking_uri,
             is_gcp_registry_uri,
             is_gcp_tracking_uri,
             parse_gcp_uri,
         )
 
-        effective_tracking_uri = _get_effective_tracking_uri(tracking_uri)
-        if not effective_tracking_uri or not is_gcp_tracking_uri(
-            effective_tracking_uri
-        ):
-            if self._auth_mode == AUTH_MODE_CAB:
-                effective_registry_uri = _get_effective_registry_uri(registry_uri)
-                if is_gcp_registry_uri(effective_registry_uri) or is_gcp_registry_uri(
-                    effective_tracking_uri
-                ):
-                    raise MlflowException(
-                        f"{AUTH_MODE_ENV_VAR}=cab requires a Managed "
-                        "Service for MLflow namespace tracking URI; "
-                        "registered-model artifact credentials "
-                        "are not supported yet. Use auto or euc mode.",
-                        error_code=INVALID_PARAMETER_VALUE,
-                    )
-                _warn_cab_inactive_once(effective_tracking_uri)
-            return None
-
-        parsed_tracking = parse_gcp_uri(effective_tracking_uri)
-        target_uri, run_id, model_id, artifact_path = _extract_namespace_cab_target(
-            artifact_uri
+        matched: RegisteredModelGcsMatch | None = (
+            matched_model
+            if matched_model is not _UNSET
+            else _match_registered_model_gcs_uri(
+                artifact_uri, tracking_uri, registry_uri
+            )
         )
 
-        return CabTokenCredentials(
-            resource_url=parsed_tracking.resource_url,
-            resource_kind=CabResourceKind.NAMESPACE,
-            access_mode=CabAccessMode.READ_ONLY,
-            artifact_uri=target_uri,
-            run_id=run_id,
-            model_id=model_id,
-            artifact_path=artifact_path,
+        if isinstance(matched, RegisteredModelGcsMatch):
+            return build_registered_model_cab_credentials(
+                registry_uri=matched.registry_resource_url,
+                model_name=matched.model_name,
+                version_root_uri=matched.version_root_uri,
+                auth_mode=self._auth_mode,
+            )
+
+        effective_tracking_uri = get_effective_tracking_uri(tracking_uri)
+        if (
+            not is_registered_model_storage_or_parent_uri(artifact_uri)
+            and effective_tracking_uri
+            and is_gcp_tracking_uri(effective_tracking_uri)
+        ):
+            parsed_tracking = parse_gcp_uri(effective_tracking_uri)
+            target_uri, run_id, model_id, artifact_path = _extract_namespace_cab_target(
+                artifact_uri
+            )
+            return CabTokenCredentials(
+                resource_url=parsed_tracking.resource_url,
+                resource_kind=CabResourceKind.NAMESPACE,
+                access_mode=CabAccessMode.READ_ONLY,
+                artifact_uri=target_uri,
+                run_id=run_id,
+                model_id=model_id,
+                artifact_path=artifact_path,
+            )
+
+        effective_registry_uri = get_effective_registry_uri(registry_uri)
+        if self._auth_mode == AUTH_MODE_CAB:
+            if (
+                is_gcp_registry_uri(effective_registry_uri)
+                or is_gcp_registry_uri(effective_tracking_uri)
+                or is_registered_model_storage_or_parent_uri(artifact_uri)
+            ):
+                raise MlflowException(
+                    f"{AUTH_MODE_ENV_VAR}=cab: cannot resolve CAB credentials "
+                    f"for artifact URI '{artifact_uri}'. The artifact URI does "
+                    "not match a known namespace run/model path nor a "
+                    "registered model path.",
+                    error_code=INVALID_PARAMETER_VALUE,
+                )
+            _warn_cab_inactive_once(effective_tracking_uri)
+            return None
+
+        return None
+
+    @classmethod
+    def for_registered_model(
+        cls,
+        underlying_uri: str,
+        *,
+        model_name: str,
+        tracking_uri: str | None,
+        effective_tracking_uri: str,
+        effective_registry_uri: str,
+        auth_mode: str | None = None,
+    ) -> GcpGCSArtifactRepository:
+        """Construct a read-only GCS artifact repository for a registered model."""
+        from google_cloud_managed_mlflow.auth import (
+            AUTH_MODE_EUC,
+            parse_auth_mode,
+        )
+        from google_cloud_managed_mlflow.cab_credentials import (
+            derive_registered_model_cab_uri,
+            is_registered_model_storage_or_parent_uri,
+            record_registered_model_download_uri,
+        )
+        from google_cloud_managed_mlflow.uri import (
+            is_gcp_tracking_uri,
+        )
+
+        is_model_storage_path = is_registered_model_storage_or_parent_uri(
+            underlying_uri
+        )
+        if is_model_storage_path:
+            record_registered_model_download_uri(
+                underlying_uri, effective_registry_uri, model_name
+            )
+
+        active_mode = auth_mode or parse_auth_mode()
+        if active_mode == AUTH_MODE_EUC:
+            return cls(
+                underlying_uri,
+                tracking_uri=tracking_uri,
+                registry_uri=effective_registry_uri,
+                cab_credentials=None,
+                is_registered_model=True,
+                _auth_mode=active_mode,
+            )
+
+        if not is_model_storage_path and is_gcp_tracking_uri(effective_tracking_uri):
+            return cls(
+                underlying_uri,
+                tracking_uri=effective_tracking_uri,
+                registry_uri=effective_registry_uri,
+                is_registered_model=True,
+                _auth_mode=active_mode,
+            )
+
+        derived_cab_uri = derive_registered_model_cab_uri(underlying_uri)
+        cab_creds = build_registered_model_cab_credentials(
+            registry_uri=effective_registry_uri,
+            model_name=model_name,
+            version_root_uri=derived_cab_uri,
+            auth_mode=active_mode,
+        )
+        return cls(
+            underlying_uri,
+            tracking_uri=tracking_uri,
+            registry_uri=effective_registry_uri,
+            cab_credentials=cab_creds,
+            is_registered_model=True,
+            _auth_mode=active_mode,
         )
 
     def _wrap_client_http_request(
         self, client: Any, mode: CabAccessMode, creds: Any
     ) -> None:
-        """Wrap client._http.request to observe successful 2xx responses."""
+        """Wrap client._http.request to observe successful 2xx responses.
+
+        High-level MLflow operations (such as log_artifacts or download_artifacts)
+        execute multiple HTTP requests against GCS. Wrapping client._http.request
+        ensures that any successful 2xx HTTP response is recorded at the transport
+        layer as proven CAB storage access, preventing subsequent authorization
+        errors (such as a 403 on a non-existent or restricted object) from incorrectly
+        triggering fallback to ADC.
+        """
         http = getattr(client, "_http", None)
         if http is None:
             return
@@ -508,20 +696,21 @@ class GcpGCSArtifactRepository(GCSArtifactRepository):
         return (res_url, bucket_name, mode)
 
     def _mark_cab_access_proven(self, mode: CabAccessMode, creds: Any) -> None:
-        self._proven_cab_modes.add(mode)
+        with self._fallback_lock:
+            self._proven_cab_modes.add(mode)
         key = self._cab_access_cache_key(mode, creds)
         with _PROVEN_CAB_ACCESS_LOCK:
             _bounded_add(_PROVEN_CAB_ACCESS_TARGETS, key)
 
     def _is_cab_access_proven(self, mode: CabAccessMode, creds: Any) -> bool:
-        if mode in self._proven_cab_modes:
-            return True
+        with self._fallback_lock:
+            if mode in self._proven_cab_modes:
+                return True
         key = self._cab_access_cache_key(mode, creds)
         with _PROVEN_CAB_ACCESS_LOCK:
             return key in _PROVEN_CAB_ACCESS_TARGETS
 
-    @property
-    def _has_cab_gcs_succeeded(self) -> bool:
+    def _active_cab_mode_and_creds(self) -> tuple[CabAccessMode, Any]:
         from google_cloud_managed_mlflow.cab_credentials import CabAccessMode
 
         mode = getattr(self._op_local, "access_mode", None)
@@ -540,32 +729,22 @@ class GcpGCSArtifactRepository(GCSArtifactRepository):
         )
         if creds is None:
             creds = self._cab_credentials
+        return mode, creds
+
+    @property
+    def _has_cab_gcs_succeeded(self) -> bool:
+        """Return whether CAB GCS access has been proven for the active mode."""
+        mode, creds = self._active_cab_mode_and_creds()
         return self._is_cab_access_proven(mode, creds)
 
     @_has_cab_gcs_succeeded.setter
     def _has_cab_gcs_succeeded(self, val: bool) -> None:
-        from google_cloud_managed_mlflow.cab_credentials import CabAccessMode
-
-        mode = getattr(self._op_local, "access_mode", None)
-        if mode is None:
-            if (
-                getattr(self._cab_credentials, "access_mode", None)
-                == CabAccessMode.READ_WRITE
-            ):
-                mode = CabAccessMode.READ_WRITE
-            else:
-                mode = CabAccessMode.READ_ONLY
-        creds = (
-            self._write_cab_credentials
-            if mode == CabAccessMode.READ_WRITE
-            else self._cab_credentials
-        )
-        if creds is None:
-            creds = self._cab_credentials
+        mode, creds = self._active_cab_mode_and_creds()
         if val:
             self._mark_cab_access_proven(mode, creds)
         else:
-            self._proven_cab_modes.discard(mode)
+            with self._fallback_lock:
+                self._proven_cab_modes.discard(mode)
             key = self._cab_access_cache_key(mode, creds)
             with _PROVEN_CAB_ACCESS_LOCK:
                 _PROVEN_CAB_ACCESS_TARGETS.discard(key)
@@ -578,8 +757,12 @@ class GcpGCSArtifactRepository(GCSArtifactRepository):
         from google_cloud_managed_mlflow.cab_credentials import CabAccessMode
 
         active_mode = mode if mode is not None else CabAccessMode.READ_ONLY
-        self._endpoint_target = getattr(
-            cab_creds, "resource_url", getattr(cab_creds, "_resource_url", "")
+        self._endpoint_target = str(
+            getattr(cab_creds, "registry_resource_url", None)
+            or getattr(
+                cab_creds, "resource_url", getattr(cab_creds, "_resource_url", "")
+            )
+            or ""
         )
         cab_client = gcs_storage.Client(project=None, credentials=cab_creds)
         # Disable google-cloud-storage's bucket metadata cache to prevent
@@ -654,11 +837,30 @@ class GcpGCSArtifactRepository(GCSArtifactRepository):
         )
 
     def _enable_write_mode(self) -> None:
-        """Elevate or prepare CAB write credentials for mutation operations."""
+        """Enable thread-local write mode and initialize the READ_WRITE CAB client."""
         from google_cloud_managed_mlflow.cab_credentials import CabAccessMode
 
         self._op_local.access_mode = CabAccessMode.READ_WRITE
         self._ensure_write_client()
+
+    def _was_closed_by_concurrent_adc_switch(
+        self, creds: CabTokenCredentials | None, exc: BaseException
+    ) -> bool:
+        """Return True if an in-flight CAB call failed because another
+        thread switched to ADC.
+        """
+        from google_cloud_managed_mlflow.cab_credentials import (
+            ClosedCabCredentialsError,
+        )
+
+        if (
+            creds is None
+            or not isinstance(exc, ClosedCabCredentialsError)
+            or not creds.closed
+        ):
+            return False
+        with self._fallback_lock:
+            return self._cab_credentials is None and self._write_cab_credentials is None
 
     def _execute_with_cab_fallback(
         self, fn: Callable[[], T], *, write: bool = False
@@ -668,13 +870,14 @@ class GcpGCSArtifactRepository(GCSArtifactRepository):
         Only auto mode with active CAB credentials can fall back; afterwards the
         instance uses ADC for the rest of its lifetime.
         """
+        from google_cloud_managed_mlflow.auth import AUTH_MODE_AUTO
         from google_cloud_managed_mlflow.cab_credentials import CabAccessMode
 
         mode = CabAccessMode.READ_WRITE if write else CabAccessMode.READ_ONLY
         self._op_local.access_mode = mode
 
         if write and self._cab_credentials is not None:
-            self._ensure_write_client()
+            self._enable_write_mode()
 
         creds = self._write_cab_credentials if write else self._cab_credentials
 
@@ -683,15 +886,22 @@ class GcpGCSArtifactRepository(GCSArtifactRepository):
 
         try:
             result = fn()
-            self._mark_cab_access_proven(mode, creds)
+            with self._fallback_lock:
+                active_creds = (
+                    self._write_cab_credentials if write else self._cab_credentials
+                )
+                still_cab = creds is not None and active_creds is creds
+            if still_cab:
+                self._mark_cab_access_proven(mode, creds)
             return result
         except Exception as exc:
             storage_proven = self._is_cab_access_proven(mode, creds)
             reason = _fallback_reason(exc, cab_storage_succeeded=storage_proven)
-            if reason is None:
+            if reason is not None:
+                if self._switch_to_adc(cause=exc):
+                    self._warn_fallback_once(reason, exc)
+            elif not self._was_closed_by_concurrent_adc_switch(creds, exc):
                 raise
-            if self._switch_to_adc(cause=exc):
-                self._warn_fallback_once(reason, exc)
             return fn()
 
     def _switch_to_adc(self, *, cause: BaseException) -> bool:
@@ -701,13 +911,13 @@ class GcpGCSArtifactRepository(GCSArtifactRepository):
         cannot be created, raises with ``cause`` chained and leaves the CAB
         client and credentials untouched.
         """
-        import google.auth
-
         with self._fallback_lock:
             stale_read = self._cab_credentials
             stale_write = self._write_cab_credentials
             if stale_read is None and stale_write is None:
                 return False
+
+            import google.auth
 
             try:
                 credentials, project = google.auth.default()
@@ -739,22 +949,15 @@ class GcpGCSArtifactRepository(GCSArtifactRepository):
         """Warn once per (namespace endpoint, bucket) and process."""
         repo_any: Any = self
         bucket_name, _ = repo_any.parse_gcs_uri(self.artifact_uri)
-        with _WARNING_LOCK:
-            if (self._endpoint_target, bucket_name) in _WARNED_FALLBACK_TARGETS:
-                return
-            _bounded_add(_WARNED_FALLBACK_TARGETS, (self._endpoint_target, bucket_name))
-        hint = (
-            "" if reason in _REASONS_WITHOUT_BUCKET_HINT else _SERVICE_AGENT_BUCKET_HINT
-        )
-        logger.warning(
-            "Google Cloud Managed Service for MLflow: using Application Default "
-            "Credentials for bucket '%s' because scoped (CAB) credentials could "
-            "not be used (%s: %s).%s",
-            bucket_name,
-            reason,
-            cause,
-            hint,
-        )
+        _warn_cab_fallback_once(self._endpoint_target, bucket_name, reason, cause)
+
+    def _reject_mutation_if_registered_model(self, operation: str) -> None:
+        if self._is_registered_model:
+            raise MlflowException(
+                f"{operation} is not supported for RegisteredModel artifacts. "
+                "Registered models are read-only.",
+                error_code=INVALID_PARAMETER_VALUE,
+            )
 
     def log_artifact(
         self,
@@ -762,6 +965,7 @@ class GcpGCSArtifactRepository(GCSArtifactRepository):
         artifact_path: str | None = None,
     ) -> None:
         """Upload a local file to GCS artifact storage."""
+        self._reject_mutation_if_registered_model("log_artifact")
         super_call: Any = super()
         self._execute_with_cab_fallback(
             lambda: super_call.log_artifact(local_file, artifact_path),
@@ -774,6 +978,7 @@ class GcpGCSArtifactRepository(GCSArtifactRepository):
         artifact_path: str | None = None,
     ) -> None:
         """Upload all files from a directory to GCS artifact storage."""
+        self._reject_mutation_if_registered_model("log_artifacts")
         super_call: Any = super()
         self._execute_with_cab_fallback(
             lambda: super_call.log_artifacts(local_dir, artifact_path),
@@ -798,6 +1003,7 @@ class GcpGCSArtifactRepository(GCSArtifactRepository):
 
     def delete_artifacts(self, artifact_path: str | None = None) -> None:
         """Delete artifacts under a given artifact path."""
+        self._reject_mutation_if_registered_model("delete_artifacts")
 
         def _delete_impl() -> None:
             repo_any: Any = self
@@ -844,6 +1050,7 @@ class GcpGCSArtifactRepository(GCSArtifactRepository):
         artifact_path: str | None = None,
     ) -> Any:
         """Create a multipart upload, unsupported when CAB credentials are used."""
+        self._reject_mutation_if_registered_model("create_multipart_upload")
         self._reject_multipart_if_cab()
         super_call: Any = super()
         return super_call.create_multipart_upload(
@@ -858,6 +1065,7 @@ class GcpGCSArtifactRepository(GCSArtifactRepository):
         artifact_path: str | None = None,
     ) -> Any:
         """Complete a multipart upload, unsupported when CAB credentials are used."""
+        self._reject_mutation_if_registered_model("complete_multipart_upload")
         self._reject_multipart_if_cab()
         super_call: Any = super()
         return super_call.complete_multipart_upload(
@@ -871,6 +1079,7 @@ class GcpGCSArtifactRepository(GCSArtifactRepository):
         artifact_path: str | None = None,
     ) -> Any:
         """Abort a multipart upload, unsupported when CAB credentials are used."""
+        self._reject_mutation_if_registered_model("abort_multipart_upload")
         self._reject_multipart_if_cab()
         super_call: Any = super()
         return super_call.abort_multipart_upload(
@@ -879,46 +1088,39 @@ class GcpGCSArtifactRepository(GCSArtifactRepository):
 
 
 def _ensure_gs_registered() -> None:
-    """Register this class for "gs" if MLflow's registry loaded before it existed.
+    """Register this class for 'gs' if MLflow's registry loaded before it existed."""
+    repair_artifact_entrypoint(
+        "gs",
+        GcpGCSArtifactRepository,
+        GCSArtifactRepository,
+        imported_before_mlflow=_IMPORTED_BEFORE_MLFLOW,
+    )
 
-    When this module is the first import, its own mlflow imports load MLflow's
-    artifact-repository registry before GcpGCSArtifactRepository is defined;
-    the import-time filter suppresses MLflow's registration warning and keeps
-    its stock GCSArtifactRepository. Re-register only if the registry still
-    holds the stock class (never override another plugin) and this class is the
-    installed "gs" entry point (never claim "gs" from an uninstalled source
-    tree). If this module triggered the first mlflow import and the repair
-    cannot run because the registry or its API is missing, log at WARNING.
-    """
-    try:
-        registry_module = sys.modules.get(
-            "mlflow.store.artifact.artifact_repository_registry"
+
+def reset_gcs_artifact_repo_state() -> None:
+    """Reset cached warnings and proven CAB access state across the process."""
+    with _WARNING_LOCK:
+        _WARNED_FALLBACK_TARGETS.clear()
+    with _WARNED_CAB_INACTIVE_LOCK:
+        _WARNED_CAB_INACTIVE_URIS.clear()
+    with _PROVEN_CAB_ACCESS_LOCK:
+        _PROVEN_CAB_ACCESS_TARGETS.clear()
+
+
+def ensure_artifact_repo_registered() -> None:
+    """Ensure both 'gs' and 'models' artifact repositories are registered in MLflow."""
+    with quiet_registration_warning():
+        from mlflow.store.artifact.artifact_repository_registry import (
+            _artifact_repository_registry,
         )
-        registry = getattr(registry_module, "_artifact_repository_registry", None)
-        if registry is None:
-            if registry_module is not None and _IMPORTED_BEFORE_MLFLOW:
-                logger.warning(
-                    "Could not register GcpGCSArtifactRepository for 'gs': "
-                    "MLflow's artifact repository registry was not found."
-                )
-            return
-        current = registry.get_registered_artifact_repositories().get("gs")
-        if current is not GCSArtifactRepository:
-            return
-        target = f"{__name__}:{GcpGCSArtifactRepository.__name__}"
-        if any(
-            ep.name == "gs" and ep.value.replace(" ", "") == target
-            for ep in importlib.metadata.entry_points(
-                group="mlflow.artifact_repository"
-            )
-        ):
-            registry.register("gs", GcpGCSArtifactRepository)
-    except Exception:
-        logger.log(
-            logging.WARNING if _IMPORTED_BEFORE_MLFLOW else logging.DEBUG,
-            "Could not repair MLflow's 'gs' registration.",
-            exc_info=True,
-        )
+
+        _artifact_repository_registry.register("gs", GcpGCSArtifactRepository)
+
+    from google_cloud_managed_mlflow.models_artifact_repo import (
+        ensure_models_repo_registered,
+    )
+
+    ensure_models_repo_registered()
 
 
 _ensure_gs_registered()

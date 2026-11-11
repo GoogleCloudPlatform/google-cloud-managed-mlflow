@@ -118,7 +118,7 @@ def test_build_tracking_store_gcp_uri() -> None:
     store = build_tracking_store(
         _GCP_TRACKING_URI, artifact_uri="gs://bucket/artifacts"
     )
-    assert isinstance(store, GcpTrackingRestStore)
+    assert isinstance(store, ts_mod.GcpTrackingRestStore)
     assert store.store_uri == _GCP_TRACKING_URI
     assert store.artifact_uri == "gs://bucket/artifacts"
     assert (
@@ -841,12 +841,16 @@ def test_ensure_tracking_store_registered() -> None:
 
 
 def test_reset_tracking_store_cache() -> None:
-    cls1 = ts_mod._get_tracking_store_cls()
-    assert cls1 is not None
-    reset_tracking_store_cache()
-    assert ts_mod._TRACKING_STORE_CLS is None
-    cls2 = ts_mod._get_tracking_store_cls()
-    assert cls2 is not None
+    orig = ts_mod._TRACKING_STORE_CLS
+    try:
+        cls1 = ts_mod._get_tracking_store_cls()
+        assert cls1 is not None
+        reset_tracking_store_cache()
+        assert ts_mod._TRACKING_STORE_CLS is None
+        cls2 = ts_mod._get_tracking_store_cls()
+        assert cls2 is not None
+    finally:
+        ts_mod._TRACKING_STORE_CLS = orig
 
 
 def test_search_datasets_raises_feature_disabled() -> None:

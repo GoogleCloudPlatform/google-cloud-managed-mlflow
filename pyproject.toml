@@ -59,6 +59,7 @@ https = "google_cloud_managed_mlflow.registry_store:build_registry_store"
 
 [project.entry-points."mlflow.artifact_repository"]
 gs = "google_cloud_managed_mlflow.gcs_artifact_repo:GcpGCSArtifactRepository"
+models = "google_cloud_managed_mlflow.models_artifact_repo:GcpModelsArtifactRepository"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -104,3 +105,8 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+
+[tool.coverage.report]
+exclude_also = [
+    "if TYPE_CHECKING:",
+]

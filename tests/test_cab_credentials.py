@@ -323,26 +323,15 @@ class TestCabTokenCredentialsRpcs:
 
     def test_registered_model_read_and_read_write_rpcs(self) -> None:
         session = unittest.mock.MagicMock(spec=requests.Session)
-        session.post.side_effect = [
-            _make_json_response(
-                200,
-                {
-                    "credentials": {
-                        "access_token": "reg-ro-tok",
-                        "expire_time": _future_rfc3339(3600),
-                    }
-                },
-            ),
-            _make_json_response(
-                200,
-                {
-                    "credentials": {
-                        "accessToken": "reg-rw-tok",
-                        "expireTime": _future_rfc3339(3600),
-                    }
-                },
-            ),
-        ]
+        session.post.return_value = _make_json_response(
+            200,
+            {
+                "credentials": {
+                    "access_token": "reg-ro-tok",
+                    "expire_time": _future_rfc3339(3600),
+                }
+            },
+        )
 
         model_url = f"{_REGISTRY_URL}/registeredModels/12345"
         creds = CabTokenCredentials(
@@ -362,16 +351,17 @@ class TestCabTokenCredentialsRpcs:
             "artifactUri": "gs://my-bucket/models/12345/artifacts"
         }
 
-        assert creds.elevate_to_read_write() is True
-        assert creds.elevate_to_read_write() is False
-        creds.refresh()
-        assert creds.token == "reg-rw-tok"
-        assert session.post.call_args_list[1].args[0] == (
-            f"{model_url}:issueReadWriteArtifactToken"
-        )
-        assert session.post.call_args_list[1].kwargs["json"] == {
-            "artifactUri": "gs://my-bucket/models/12345/artifacts"
-        }
+        with pytest.raises(MlflowException, match="READ_WRITE"):
+            creds.elevate_to_read_write()
+        with pytest.raises(MlflowException, match="READ_ONLY"):
+            CabTokenCredentials(
+                resource_url=model_url,
+                resource_kind=CabResourceKind.REGISTERED_MODEL,
+                access_mode=CabAccessMode.READ_WRITE,
+                artifact_uri="gs://my-bucket/models/12345/artifacts",
+                session=session,
+                auth=unittest.mock.MagicMock(),
+            )
 
     @pytest.mark.parametrize(
         "forbidden_kwargs",

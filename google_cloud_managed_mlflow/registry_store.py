@@ -21,7 +21,7 @@ import os
 import re
 import sys
 import urllib.parse
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 if TYPE_CHECKING:
     from mlflow.store.model_registry.rest_store import RestStore
@@ -71,6 +71,7 @@ __all__ = [
     "build_registry_store",
     "ensure_registry_store_registered",
     "normalize_registry_response",
+    "raise_for_namespace_as_registry_uri",
     "reset_registry_store_cache",
 ]
 
@@ -125,6 +126,108 @@ def _sanitize_prompt_filter(filter_str: str) -> str:
     return cleaned.strip()
 
 
+def _extract_clean_model_name(val: Any) -> str | None:
+    """Extract model name suffix from full resource path if present."""
+    if not isinstance(val, str):
+        return None
+    suffix = val.rsplit("/registeredModels/", 1)[-1]
+    return suffix if suffix.strip() else None
+
+
+def _should_invalidate_cache_on_error(
+    exc: BaseException | None, *, invalidate_on_404: bool = False
+) -> bool:
+    """Return True if an RPC outcome warrants cache invalidation.
+
+    Successful RPCs (exc is None) or ambiguous server/network errors (HTTP 5xx,
+    timeouts, network disconnects) may have mutated server state and require
+    invalidating stale cache entries. Deterministic client errors (HTTP 400,
+    401, 403, 409, and HTTP 404 when invalidate_on_404 is False) confirm that
+    no server-side mutation occurred, preserving cache entries.
+    """
+    if exc is None:
+        return True
+    http_status = getattr(exc, "http_status", None)
+    error_code = getattr(exc, "error_code", None)
+    non_mutating_statuses = {400, 401, 403, 409}
+    if not invalidate_on_404:
+        non_mutating_statuses.add(404)
+    if isinstance(http_status, int) and http_status in non_mutating_statuses:
+        return False
+
+    non_mutating_codes = {
+        "INVALID_PARAMETER_VALUE",
+        "INVALID_STATE",
+        "UNAUTHENTICATED",
+        "PERMISSION_DENIED",
+        "RESOURCE_ALREADY_EXISTS",
+    }
+    if not invalidate_on_404:
+        non_mutating_codes.add("RESOURCE_DOES_NOT_EXIST")
+    if isinstance(error_code, str) and error_code in non_mutating_codes:
+        return False
+
+    return True
+
+
+def _sync_model_cache_after_rpc(
+    endpoint_url: str,
+    api_name: str,
+    clean_name: str | None,
+    clean_new_name: str | None,
+    call_exc: BaseException | None,
+    *,
+    canonical_resource_id: str | None = None,
+) -> None:
+    """Synchronize registered model caches following an endpoint RPC."""
+    if api_name not in (
+        "CreateRegisteredModel",
+        "DeleteRegisteredModel",
+        "RenameRegisteredModel",
+    ):
+        return
+
+    from google_cloud_managed_mlflow.cab_credentials import (
+        invalidate_registered_model_resource_url,
+        rename_registered_model_cache_entries,
+    )
+
+    if api_name == "CreateRegisteredModel":
+        # Invalidate stale display-name mappings on success or ambiguous 5xx failures
+        # to clear display-name collisions from prior delete/recreate cycles.
+        if clean_name is not None and _should_invalidate_cache_on_error(
+            call_exc, invalidate_on_404=False
+        ):
+            invalidate_registered_model_resource_url(endpoint_url, clean_name)
+    elif api_name == "DeleteRegisteredModel":
+        if clean_name is not None and _should_invalidate_cache_on_error(
+            call_exc, invalidate_on_404=True
+        ):
+            invalidate_registered_model_resource_url(endpoint_url, clean_name)
+    elif api_name == "RenameRegisteredModel":
+        if call_exc is None:
+            if clean_name and clean_new_name:
+                rename_registered_model_cache_entries(
+                    endpoint_url,
+                    clean_name,
+                    clean_new_name,
+                    canonical_resource_id=canonical_resource_id,
+                )
+            elif clean_name is not None:
+                invalidate_registered_model_resource_url(endpoint_url, clean_name)
+            elif clean_new_name is not None:
+                invalidate_registered_model_resource_url(endpoint_url, clean_new_name)
+        else:
+            if clean_name is not None and _should_invalidate_cache_on_error(
+                call_exc, invalidate_on_404=True
+            ):
+                invalidate_registered_model_resource_url(endpoint_url, clean_name)
+            if clean_new_name is not None and _should_invalidate_cache_on_error(
+                call_exc, invalidate_on_404=False
+            ):
+                invalidate_registered_model_resource_url(endpoint_url, clean_new_name)
+
+
 def _sanitize_and_quote_model_name(raw_name: Any) -> str:
     """Validate and percent-encode model name for URL path construction."""
     from mlflow.exceptions import MlflowException
@@ -135,12 +238,8 @@ def _sanitize_and_quote_model_name(raw_name: Any) -> str:
             "Registered model name is required.",
             error_code=INVALID_PARAMETER_VALUE,
         )
-    name = (
-        raw_name.split("/registeredModels/")[-1]
-        if "/registeredModels/" in raw_name
-        else raw_name
-    )
-    if not name.strip():
+    name = _extract_clean_model_name(raw_name)
+    if not name or not name.strip():
         raise MlflowException(
             "Registered model name cannot be empty or whitespace.",
             error_code=INVALID_PARAMETER_VALUE,
@@ -605,11 +704,7 @@ def _build_registry_store_class() -> type[Any]:
         ) -> tuple[str, dict[str, Any] | None]:
             raw_name = payload.get("name")
             quoted_name = _sanitize_and_quote_model_name(raw_name)
-            name = (
-                raw_name.split("/registeredModels/")[-1]
-                if isinstance(raw_name, str) and "/registeredModels/" in raw_name
-                else raw_name
-            )
+            name = _extract_clean_model_name(raw_name) or raw_name
             if api_name == "DeleteRegisteredModel":
                 return f"/registeredModels/{quoted_name}", None
             if api_name == "DeleteModelVersion":
@@ -673,11 +768,7 @@ def _build_registry_store_class() -> type[Any]:
         ) -> tuple[str, str, dict[str, Any] | None, dict[str, Any] | None]:
             raw_name = payload.pop("name", None)
             _ = _sanitize_and_quote_model_name(raw_name)
-            name = (
-                raw_name.split("/registeredModels/")[-1]
-                if isinstance(raw_name, str) and "/registeredModels/" in raw_name
-                else raw_name
-            )
+            name = _extract_clean_model_name(raw_name) or raw_name
             tags = payload.pop("tags", [])
             desc = payload.pop("description", None)
             if isinstance(tags, list):
@@ -783,55 +874,100 @@ def _build_registry_store_class() -> type[Any]:
                 payload = dict(json_body)
 
             api_name = getattr(api, "__name__", str(api))
-            endpoint, method, params, body = self._dispatch_request(
-                api_name, api, payload
-            )
+            raw_name = payload.get("name")
+            raw_new_name = payload.get("new_name")
 
-            call_kwargs: dict[str, Any] = {
-                "host_creds": self.get_host_creds(),
-                "endpoint": endpoint,
-                "method": method,
-                "allow_redirects": False,
-            }
-            if extra_headers is not None:
-                call_kwargs["extra_headers"] = extra_headers
-            if (
-                "retry_timeout_seconds" in kwargs
-                and kwargs["retry_timeout_seconds"] is not None
-            ):
-                call_kwargs["retry_timeout_seconds"] = kwargs["retry_timeout_seconds"]
+            clean_name = _extract_clean_model_name(raw_name)
+            clean_new_name = _extract_clean_model_name(raw_new_name)
 
-            if params is not None:
-                call_kwargs["params"] = params
-            if body is not None:
-                call_kwargs["json"] = body
+            call_exc: BaseException | None = None
+            canonical_resource_id: str | None = None
+            try:
+                endpoint, method, params, body = self._dispatch_request(
+                    api_name, api, payload
+                )
 
-            response = rest_utils.http_request(**call_kwargs)
+                call_kwargs: dict[str, Any] = {
+                    "host_creds": self.get_host_creds(),
+                    "endpoint": endpoint,
+                    "method": method,
+                    "allow_redirects": False,
+                }
+                if extra_headers is not None:
+                    call_kwargs["extra_headers"] = extra_headers
+                if (
+                    "retry_timeout_seconds" in kwargs
+                    and kwargs["retry_timeout_seconds"] is not None
+                ):
+                    call_kwargs["retry_timeout_seconds"] = kwargs[
+                        "retry_timeout_seconds"
+                    ]
 
-            if response.status_code >= 400:
-                uri.raise_for_aip193_error(response)
+                if params is not None:
+                    call_kwargs["params"] = params
+                if body is not None:
+                    call_kwargs["json"] = body
 
-            if response_proto is None:
-                self_any: Any = self
-                if hasattr(self, "_get_response_from_method"):
-                    try:
-                        response_proto = self_any._get_response_from_method(api)
-                    except Exception:
-                        response_proto = getattr(api, "Response", lambda: None)()
-                elif hasattr(api, "Response"):
-                    response_proto = api.Response()
+                response = rest_utils.http_request(**call_kwargs)
 
-            if response.status_code == 204 or not (response.text or "").strip():
+                if response.status_code >= 400:
+                    uri.raise_for_aip193_error(response)
+
+                if response_proto is None:
+                    self_any: Any = self
+                    if hasattr(self, "_get_response_from_method"):
+                        try:
+                            response_proto = self_any._get_response_from_method(api)
+                        except Exception:
+                            response_proto = getattr(api, "Response", lambda: None)()
+                    elif hasattr(api, "Response"):
+                        response_proto = api.Response()
+
+                if response.status_code == 204 or not (response.text or "").strip():
+                    return response_proto
+
+                response = rest_utils.verify_rest_response(response, endpoint)
+
+                js_dict = json.loads(response.text)
+                js_dict = normalize_registry_response(
+                    api, js_dict, response_proto=response_proto
+                )
+                if api_name == "RenameRegisteredModel" and isinstance(js_dict, dict):
+                    reg_model = js_dict.get("registered_model")
+                    if isinstance(reg_model, dict):
+                        raw_id = reg_model.get("name")
+                        if isinstance(raw_id, str) and raw_id:
+                            canonical_resource_id = raw_id
+
+                if (
+                    api_name == "GetModelVersionDownloadUri"
+                    and clean_name is not None
+                    and isinstance(js_dict, dict)
+                ):
+                    from google_cloud_managed_mlflow.cab_credentials import (
+                        record_registered_model_download_uri,
+                    )
+
+                    dl_uri = js_dict.get("artifact_uri")
+                    if isinstance(dl_uri, str) and dl_uri:
+                        record_registered_model_download_uri(
+                            dl_uri, self.endpoint_url, clean_name
+                        )
+
+                proto_json_utils.parse_dict(js_dict=js_dict, message=response_proto)
                 return response_proto
-
-            response = rest_utils.verify_rest_response(response, endpoint)
-
-            js_dict = json.loads(response.text)
-            js_dict = normalize_registry_response(
-                api, js_dict, response_proto=response_proto
-            )
-            proto_json_utils.parse_dict(js_dict=js_dict, message=response_proto)
-            return response_proto
+            except BaseException as exc:
+                call_exc = exc
+                raise
+            finally:
+                _sync_model_cache_after_rpc(
+                    self.endpoint_url,
+                    api_name,
+                    clean_name,
+                    clean_new_name,
+                    call_exc,
+                    canonical_resource_id=canonical_resource_id,
+                )
 
     return GcpModelRegistryRestStore
 
@@ -842,6 +978,24 @@ def _get_registry_store_cls() -> type[Any]:
     if _REGISTRY_STORE_CLS is None:
         _REGISTRY_STORE_CLS = _build_registry_store_class()
     return _REGISTRY_STORE_CLS
+
+
+def raise_for_namespace_as_registry_uri(store_uri: str) -> NoReturn:
+    """Raise an MlflowException explaining that a namespace URI cannot be used
+    as a registry URI.
+    """
+    from mlflow.exceptions import MlflowException
+    from mlflow.protos.databricks_pb2 import INVALID_PARAMETER_VALUE
+
+    raise MlflowException(
+        f"The provided URI '{store_uri}' is a Managed MLflow tracking "
+        "namespace URI, not a model registry URI. Managed MLflow requires "
+        "a dedicated model registry URI (e.g., "
+        "'https://mlflow.googleapis.com/v1/projects/<project>/"
+        "locations/<location>/registries/<registry>'). "
+        "Please configure MLFLOW_REGISTRY_URI or pass registry_uri explicitly.",
+        error_code=INVALID_PARAMETER_VALUE,
+    )
 
 
 def build_registry_store(
@@ -858,18 +1012,7 @@ def build_registry_store(
 
     if not uri.is_gcp_registry_uri(store_uri):
         if uri.is_gcp_mlflow_uri(store_uri):
-            from mlflow.exceptions import MlflowException
-            from mlflow.protos.databricks_pb2 import INVALID_PARAMETER_VALUE
-
-            raise MlflowException(
-                f"The provided URI '{store_uri}' is a Managed MLflow tracking "
-                "namespace URI, not a model registry URI. Managed MLflow requires "
-                "a dedicated model registry URI (e.g., "
-                "'https://mlflow.googleapis.com/v1/projects/<project>/"
-                "locations/<location>/registries/<registry>'). "
-                "Please configure MLFLOW_REGISTRY_URI or pass registry_uri explicitly.",
-                error_code=INVALID_PARAMETER_VALUE,
-            )
+            raise_for_namespace_as_registry_uri(store_uri)
         from mlflow.tracking._model_registry.utils import _get_rest_store
 
         return _get_rest_store(store_uri, **kwargs)

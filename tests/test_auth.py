@@ -23,8 +23,11 @@ import importlib
 import importlib.metadata
 import ipaddress
 import json
+import os
 import shutil
 import ssl
+import subprocess
+import sys
 import threading
 import unittest.mock
 import zipfile
@@ -498,11 +501,15 @@ def test_tls12_ssl_context_and_create_secure_session(tmp_path: Path) -> None:
 
     assert google_cloud_managed_mlflow.__all__ == [
         "__version__",
+        "GcpGCSArtifactRepository",
         "GcpModelRegistryRestStore",
+        "GcpModelsArtifactRepository",
         "GcpTrackingRestStore",
         "build_registry_store",
         "build_tracking_store",
+        "ensure_artifact_repo_registered",
         "ensure_registry_store_registered",
+        "ensure_tracking_store_registered",
     ]
 
     ca1_cert, ca1_key = _generate_self_signed_cert(tmp_path, "ca1")
@@ -1137,14 +1144,30 @@ def test_auth_provider_and_end_to_end_mlflow_client(
 
 def test_non_interference_regression() -> None:
     """Importing the plugin must not monkey-patch MLflow's shared session factory."""
-    session_fn = mlflow.utils.request_utils._get_request_session
-    assert session_fn.__module__ == "mlflow.utils.request_utils"
-
-    with mlflow.utils.request_utils._get_request_session(
-        3, 1.0, 0.5, (429,), True, True
-    ) as session:
-        https_adapter = session.get_adapter("https://mlflow.example.com")
-        assert not isinstance(https_adapter, _Tls12HttpAdapter)
+    code = (
+        "import sys\n"
+        "import google_cloud_managed_mlflow\n"
+        "import mlflow.utils.request_utils\n"
+        "from google_cloud_managed_mlflow.auth import _Tls12HttpAdapter\n"
+        "session_fn = mlflow.utils.request_utils._get_request_session\n"
+        "assert session_fn.__module__ == 'mlflow.utils.request_utils'\n"
+        "with mlflow.utils.request_utils._get_request_session(\n"
+        "    3, 1.0, 0.5, (429,), True, True\n"
+        ") as session:\n"
+        "    https_adapter = session.get_adapter('https://mlflow.example.com')\n"
+        "    assert not isinstance(https_adapter, _Tls12HttpAdapter)\n"
+        "print('OK')\n"
+    )
+    repo_root = str(Path(__file__).resolve().parent.parent)
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "PYTHONPATH": repo_root},
+    )
+    assert result.returncode == 0, f"Error: {result.stderr}"
+    assert "OK" in result.stdout
 
 
 def test_wheel_packaging_metadata_and_dynamic_version(
