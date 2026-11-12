@@ -230,7 +230,7 @@ def test_parsed_gcp_uri_origin_formatting(
             },
         ),
         (
-            "https://europe-west1-mlflow.googleapis.com/v1alpha/projects/dsml-testing/locations/europe-west1/namespaces/demo_test",
+            "https://europe-west1-mlflow.googleapis.com/v1alpha/projects/my-gcp-project/locations/europe-west1/namespaces/demo_test",
             {
                 "host": "europe-west1-mlflow.googleapis.com",
                 "location": "europe-west1",
@@ -1499,8 +1499,8 @@ def test_raise_for_aip193_error_info_reason_foreign_domain_ignored() -> None:
     assert exc_info.value.error_code == ErrorCode.Name(INVALID_STATE)
 
 
-def test_raise_for_aip193_error_info_reason_staging_domain_accepted() -> None:
-    """Verify ErrorInfo from staging Managed MLflow domains is accepted."""
+def test_raise_for_aip193_error_info_reason_regional_domain_accepted() -> None:
+    """Verify ErrorInfo from regional Managed MLflow domains is accepted."""
     resp = _make_response(
         400,
         payload={
@@ -1511,7 +1511,7 @@ def test_raise_for_aip193_error_info_reason_staging_domain_accepted() -> None:
                 "details": [
                     {
                         "@type": "type.googleapis.com/google.rpc.ErrorInfo",
-                        "domain": "staging-mlflow.googleapis.com",
+                        "domain": "us-central1-mlflow.googleapis.com",
                         "reason": "RESOURCE_ALREADY_EXISTS",
                     }
                 ],

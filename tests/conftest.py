@@ -17,9 +17,11 @@
 from __future__ import annotations
 
 import sys
+import unittest.mock
 from collections.abc import Generator
 
 import pytest
+from google.auth.credentials import AnonymousCredentials
 
 
 def _reset_plugin_caches() -> None:
@@ -51,3 +53,28 @@ def _reset_plugin_global_caches() -> Generator[None, None, None]:
         yield
     finally:
         _reset_plugin_caches()
+
+
+_AMBIENT_GCP_ENV_VARS = (
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CLOUD_PROJECT",
+    "GCLOUD_PROJECT",
+    "CLOUDSDK_CORE_PROJECT",
+)
+
+
+@pytest.fixture(autouse=True)
+def _mock_google_auth_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Generator[None, None, None]:
+    """Provide fallback mock credentials so unit tests never depend on ambient ADC."""
+    for env_var in _AMBIENT_GCP_ENV_VARS:
+        monkeypatch.delenv(env_var, raising=False)
+    with unittest.mock.patch(
+        "google.auth.default",
+        side_effect=lambda *args, **kwargs: (
+            AnonymousCredentials(),
+            "mock-default-project",
+        ),
+    ):
+        yield

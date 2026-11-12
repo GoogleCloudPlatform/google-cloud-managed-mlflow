@@ -25,7 +25,7 @@ points for:
 
 ## Installation
 
-Once published to PyPI, install the package with `pip`:
+Install the package with `pip`:
 
 ```bash
 pip install google-cloud-managed-mlflow
@@ -34,7 +34,7 @@ pip install google-cloud-managed-mlflow
 ## Contributing
 
 Contributions to this project are welcome and encouraged. Please see
-[CONTRIBUTING.md](CONTRIBUTING.md) for instructions on signing the Google
+[CONTRIBUTING.md](https://github.com/GoogleCloudPlatform/google-cloud-managed-mlflow/blob/main/CONTRIBUTING.md) for instructions on signing the Google
 Contributor License Agreement (<https://cla.developers.google.com/>), submitting
 pull requests, and reviewing our
 [Open Source Community Guidelines](https://opensource.google/conduct/).
@@ -42,13 +42,13 @@ pull requests, and reviewing our
 ## Security Policy
 
 To report a security vulnerability, please follow the instructions in
-[SECURITY.md](SECURITY.md) and submit your report via
+[SECURITY.md](https://github.com/GoogleCloudPlatform/google-cloud-managed-mlflow/blob/main/SECURITY.md) and submit your report via
 <https://goo.gle/vulnz> (<https://g.co/vulnz>).
 
 ## License & Terms of Service
 
 This project is licensed under the Apache License, Version 2.0 — see
-[LICENSE](LICENSE) for full details.
+[LICENSE](https://github.com/GoogleCloudPlatform/google-cloud-managed-mlflow/blob/main/LICENSE) for full details.
 
 Your use of Google Cloud services with this plugin is governed by the
 [Google Cloud Terms of Service](https://cloud.google.com/terms).

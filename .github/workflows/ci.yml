@@ -1,0 +1,93 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  schedule:
+    - cron: "0 9 * * 1"
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Test (Python ${{ matrix.python-version }}, MLflow ${{ matrix.mlflow-tier }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        mlflow-tier: ["latest"]
+        include:
+          - python-version: "3.12"
+            mlflow-tier: "minimum"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        env:
+          MLFLOW_TIER: ${{ matrix.mlflow-tier }}
+        run: |
+          python -m pip install --upgrade pip
+          if [ "${MLFLOW_TIER}" = "minimum" ]; then
+            MLFLOW_FLOOR=$(python -c 'import re, tomllib; deps = tomllib.load(open("pyproject.toml", "rb"))["project"]["dependencies"]; print(next(re.match(r"mlflow>=([^\s,;]+)", d).group(1) for d in deps if d.startswith("mlflow>=")))')
+            python -m pip install ".[dev]" "mlflow==${MLFLOW_FLOOR}"
+          else
+            python -m pip install ".[dev]"
+          fi
+
+      - name: Run Ruff format check
+        run: ruff format --check .
+
+      - name: Run Ruff check
+        run: ruff check .
+
+      - name: Run mypy
+        env:
+          MATRIX_PYTHON_VERSION: ${{ matrix.python-version }}
+        run: mypy --strict --python-version "${MATRIX_PYTHON_VERSION}" google_cloud_managed_mlflow tests
+
+      - name: Run pytest
+        run: pytest -v
+
+      - name: Build and check sdist and wheel
+        run: |
+          python -m build
+          twine check --strict dist/*
+          python -c '
+          import glob, tarfile, zipfile
+          with tarfile.open(glob.glob("dist/*.tar.gz")[0]) as tf:
+              assert any(n.endswith("/tests/conftest.py") for n in tf.getnames()), "tests/conftest.py missing from sdist"
+          with zipfile.ZipFile(glob.glob("dist/*.whl")[0]) as zf:
+              assert not any(n.startswith("tests/") for n in zf.namelist()), "tests/ leaked into wheel"
+          '
