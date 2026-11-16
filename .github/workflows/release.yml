@@ -150,28 +150,27 @@ jobs:
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
 
       - name: Clean up any prior staged version in Artifact Registry
-        # Probes repository existence and IAM first because versions delete returns NOT_FOUND
-        # indistinguishably for a missing repository, an uncreated package, or an absent version.
+        # Probe packages list before versions list because versions list/delete both return
+        # NOT_FOUND when the parent package does not yet exist on an initial release.
+        # Keep gcloud command substitutions outside `if` so `set -e` still fails fast on
+        # WIF, IAM, or missing-repository errors.
+        shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          gcloud artifacts repositories describe "${EXIT_GATE_REPO}" \
-            --project="${EXIT_GATE_HOST_PROJECT}" \
-            --location="${EXIT_GATE_LOCATION}" >/dev/null
-
-          DELETE_RC=0
-          DELETE_OUT=$(gcloud artifacts versions delete "${VERSION}" \
-            --package="${PYPI_PACKAGE}" \
-            --project="${EXIT_GATE_HOST_PROJECT}" \
-            --repository="${EXIT_GATE_REPO}" \
-            --location="${EXIT_GATE_LOCATION}" \
-            --quiet 2>&1) || DELETE_RC=$?
-
-          if [ "${DELETE_RC}" -ne 0 ]; then
-            if printf '%s\n' "${DELETE_OUT}" | grep -Eq '(^|[[:space:]:])NOT_FOUND([[:space:]:]|$)'; then
+          REPO_FLAGS=(
+            --project="${EXIT_GATE_HOST_PROJECT}"
+            --repository="${EXIT_GATE_REPO}"
+            --location="${EXIT_GATE_LOCATION}"
+          )
+          PACKAGES=$(gcloud artifacts packages list "${REPO_FLAGS[@]}" --format="value(name.basename())")
+          if ! grep -Fxq -- "${PYPI_PACKAGE}" <<< "${PACKAGES}"; then
+            echo "Package ${PYPI_PACKAGE} not yet present in ${EXIT_GATE_REPO}; skipping cleanup."
+          else
+            VERSIONS=$(gcloud artifacts versions list "${REPO_FLAGS[@]}" --package="${PYPI_PACKAGE}" --format="value(name.basename())")
+            if ! grep -Fxq -- "${VERSION}" <<< "${VERSIONS}"; then
               echo "No prior staged version found for ${PYPI_PACKAGE} ${VERSION}; proceeding."
             else
-              printf '%s\n' "${DELETE_OUT}" >&2
-              exit "${DELETE_RC}"
+              gcloud artifacts versions delete "${VERSION}" "${REPO_FLAGS[@]}" --package="${PYPI_PACKAGE}" --quiet
             fi
           fi
 
