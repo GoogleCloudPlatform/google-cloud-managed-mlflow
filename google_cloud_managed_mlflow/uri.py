@@ -1148,3 +1148,33 @@ def resolve_effective_registry_uri(
     if explicit_ctx_uri and isinstance(explicit_ctx_uri, str):
         return explicit_ctx_uri
     return effective_tracking_uri
+
+
+class ManagedUriResolution(NamedTuple):
+    """Effective tracking and registry URIs and whether either targets GCP."""
+
+    tracking_uri: str
+    registry_uri: str
+    is_managed: bool
+
+
+def resolve_managed_uris(
+    tracking_uri: str | None = None,
+    registry_uri: str | None = None,
+) -> ManagedUriResolution:
+    """Return effective tracking/registry URIs and whether either targets GCP."""
+    try:
+        eff_tracking = get_effective_tracking_uri(tracking_uri)
+        eff_registry = resolve_effective_registry_uri(registry_uri, eff_tracking)
+    except MlflowException:
+        return ManagedUriResolution("", "", False)
+    managed = is_gcp_tracking_uri(eff_tracking) or is_gcp_registry_uri(eff_registry)
+    return ManagedUriResolution(eff_tracking, eff_registry, managed)
+
+
+def is_gcp_context(
+    tracking_uri: str | None = None,
+    registry_uri: str | None = None,
+) -> bool:
+    """Return True if effective tracking or registry URIs target Managed MLflow."""
+    return resolve_managed_uris(tracking_uri, registry_uri)[2]

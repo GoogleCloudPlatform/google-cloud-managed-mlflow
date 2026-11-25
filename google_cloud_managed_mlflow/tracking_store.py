@@ -583,6 +583,9 @@ def build_tracking_store(
 
         return _get_rest_store(store_uri, artifact_uri=artifact_uri, **kwargs)
 
+    from google_cloud_managed_mlflow.spark import install_spark_hooks
+
+    install_spark_hooks()
     cls = _get_tracking_store_cls()
     return cls(store_uri=store_uri, artifact_uri=artifact_uri, **kwargs)
 
@@ -593,6 +596,9 @@ def ensure_tracking_store_registered() -> bool:
     Registers https under _tracking_store_registry if present, ensures
     Google Cloud auth provider is registered, and hardens the request session.
     """
+    from google_cloud_managed_mlflow.spark import install_spark_hooks
+
+    install_spark_hooks()
     try:
         from google_cloud_managed_mlflow import auth
 
@@ -602,10 +608,10 @@ def ensure_tracking_store_registered() -> bool:
         import mlflow.tracking._tracking_service.utils as tr_utils
 
         registry = getattr(tr_utils, "_tracking_store_registry", None)
-        if registry is not None:
-            registry.register("https", build_tracking_store)
-            return True
-        return False
+        if registry is None:
+            return False
+        registry.register("https", build_tracking_store)
+        return True
     except Exception:
         return False
 
@@ -615,3 +621,8 @@ def __getattr__(name: str) -> Any:
     if name == "GcpTrackingRestStore":
         return _get_tracking_store_cls()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+from google_cloud_managed_mlflow.spark import install_spark_hooks  # noqa: E402
+
+install_spark_hooks()

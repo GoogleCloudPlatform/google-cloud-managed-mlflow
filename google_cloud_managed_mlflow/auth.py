@@ -560,6 +560,9 @@ class GoogleCloudAuthProvider(RequestAuthProvider):
 
     def get_auth(self) -> GoogleCloudBearerAuth:
         """Return the GoogleCloudBearerAuth instance."""
+        from google_cloud_managed_mlflow.spark import install_spark_hooks
+
+        install_spark_hooks()
         return GoogleCloudBearerAuth.get_instance()
 
 
@@ -577,6 +580,9 @@ def ensure_auth_provider_registered() -> bool:
     Returns True when the provider is present or newly registered, or False if
     MLflow's request_auth registry internals are unavailable.
     """
+    from google_cloud_managed_mlflow.spark import install_spark_hooks
+
+    install_spark_hooks()
     try:
         from mlflow.tracking.request_auth.registry import (
             _request_auth_provider_registry,

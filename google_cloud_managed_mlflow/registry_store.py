@@ -1017,6 +1017,9 @@ def build_registry_store(
 
         return _get_rest_store(store_uri, **kwargs)
 
+    from google_cloud_managed_mlflow.spark import install_spark_hooks
+
+    install_spark_hooks()
     cls = _get_registry_store_cls()
     return cls(store_uri=store_uri, tracking_uri=tracking_uri, **kwargs)
 
@@ -1027,6 +1030,9 @@ def ensure_registry_store_registered() -> bool:
     Registers https under model registry store registry if present, ensures
     Google Cloud auth provider is registered, and hardens the request session.
     """
+    from google_cloud_managed_mlflow.spark import install_spark_hooks
+
+    install_spark_hooks()
     try:
         from google_cloud_managed_mlflow import auth
 
@@ -1041,10 +1047,10 @@ def ensure_registry_store_registered() -> bool:
         elif hasattr(reg_utils, "_model_registry_store_registry"):
             registry = reg_utils._model_registry_store_registry
 
-        if registry is not None:
-            registry.register("https", build_registry_store)
-            return True
-        return False
+        if registry is None:
+            return False
+        registry.register("https", build_registry_store)
+        return True
     except Exception:
         return False
 
@@ -1055,6 +1061,10 @@ def __getattr__(name: str) -> Any:
         return _get_registry_store_cls()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
+
+from google_cloud_managed_mlflow.spark import install_spark_hooks  # noqa: E402
+
+install_spark_hooks()
 
 if "mlflow" in sys.modules:
     ensure_registry_store_registered()
