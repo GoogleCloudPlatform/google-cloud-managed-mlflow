@@ -980,9 +980,24 @@ def _get_registry_store_cls() -> type[Any]:
     return _REGISTRY_STORE_CLS
 
 
+# Default to v1alpha when store_uri cannot be validated/parsed because Managed
+# MLflow registries are currently exposed under the v1alpha API surface.
+_FALLBACK_REGISTRY_URI_EXAMPLE = (
+    "https://mlflow.googleapis.com/v1alpha/projects/<project>/"
+    "locations/<location>/registries/<registry>"
+)
+
+
 def raise_for_namespace_as_registry_uri(store_uri: str) -> NoReturn:
-    """Raise an MlflowException explaining that a namespace URI cannot be used
-    as a registry URI.
+    """Raise MlflowException rejecting a tracking namespace URI as a registry URI.
+
+    Args:
+        store_uri: Rejected store URI. Echoes its endpoint, API version, project,
+            and location in the example registry URI when parseable, or falls back
+            to a generic v1alpha placeholder URI otherwise.
+
+    Raises:
+        MlflowException: Always raised with ``INVALID_PARAMETER_VALUE``.
     """
     from mlflow.exceptions import MlflowException
     from mlflow.protos.databricks_pb2 import INVALID_PARAMETER_VALUE
@@ -990,12 +1005,34 @@ def raise_for_namespace_as_registry_uri(store_uri: str) -> NoReturn:
     raise MlflowException(
         f"The provided URI '{store_uri}' is a Managed MLflow tracking "
         "namespace URI, not a model registry URI. Managed MLflow requires "
-        "a dedicated model registry URI (e.g., "
-        "'https://mlflow.googleapis.com/v1/projects/<project>/"
-        "locations/<location>/registries/<registry>'). "
-        "Please configure MLFLOW_REGISTRY_URI or pass registry_uri explicitly.",
+        f"a dedicated model registry URI (e.g., '{_example_registry_uri(store_uri)}'). "
+        "Please configure MLFLOW_REGISTRY_URI or pass registry_uri explicitly. "
+        "If this is raised inside a Spark executor or UDF (for example "
+        "mlflow.pyfunc.spark_udf() loading a models:/ URI under Spark Connect), "
+        "a registry URI set on the driver with mlflow.set_registry_uri() is not "
+        "propagated to the executor: pass "
+        "extra_env={'MLFLOW_REGISTRY_URI': '<registry URI>'} to spark_udf() or "
+        "set MLFLOW_REGISTRY_URI in the executor environment.",
         error_code=INVALID_PARAMETER_VALUE,
     )
+
+
+def _example_registry_uri(store_uri: str) -> str:
+    """Return a registry URI example matching the namespace URI's endpoint.
+
+    Reuses the caller's origin, API version, project, and location so the hint
+    is directly actionable; only the registry ID stays a placeholder because a
+    namespace and a registry are independent resources.
+    """
+    from mlflow.exceptions import MlflowException
+
+    from google_cloud_managed_mlflow.uri import parse_gcp_uri
+
+    try:
+        parsed = parse_gcp_uri(store_uri)
+    except MlflowException:
+        return _FALLBACK_REGISTRY_URI_EXAMPLE
+    return f"{parsed.api_root}/{parsed.parent}/registries/<registry>"
 
 
 def build_registry_store(
