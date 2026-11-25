@@ -41,6 +41,7 @@ from google_cloud_managed_mlflow.registry_store import (
     build_registry_store,
     ensure_registry_store_registered,
     normalize_registry_response,
+    raise_for_namespace_as_registry_uri,
     reset_registry_store_cache,
 )
 from google_cloud_managed_mlflow.uri import GcpMlflowApiError
@@ -1147,15 +1148,47 @@ def test_dispatch_update_registered_model_description_none_vs_provided() -> None
     assert body == {"description": "new description"}
 
 
-def test_build_registry_store_with_namespace_uri_raises() -> None:
-    namespace_uri = (
-        "https://mlflow.googleapis.com/v1/projects/my-project"
-        "/locations/us-central1/namespaces/my-namespace"
-    )
+@pytest.mark.parametrize(
+    ("namespace_uri", "expected_example_uri"),
+    [
+        pytest.param(
+            "https://mlflow.googleapis.com/v1/projects/my-project"
+            "/locations/us-central1/namespaces/my-namespace",
+            "https://mlflow.googleapis.com/v1/projects/my-project"
+            "/locations/us-central1/registries/<registry>",
+            id="v1_default_origin",
+        ),
+        pytest.param(
+            "https://asia-east1-mlflow.googleapis.com/v1alpha/projects/other-proj"
+            "/locations/asia-east1/namespaces/my-namespace",
+            "https://asia-east1-mlflow.googleapis.com/v1alpha/projects/other-proj"
+            "/locations/asia-east1/registries/<registry>",
+            id="v1alpha_regional_origin",
+        ),
+    ],
+)
+def test_build_registry_store_with_namespace_uri_raises(
+    namespace_uri: str, expected_example_uri: str
+) -> None:
     with pytest.raises(MlflowException) as exc_info:
         build_registry_store(namespace_uri)
-    assert "tracking namespace URI" in str(exc_info.value)
-    assert "Please configure MLFLOW_REGISTRY_URI" in str(exc_info.value)
+    assert exc_info.value.error_code == "INVALID_PARAMETER_VALUE"
+    message = str(exc_info.value)
+    assert "tracking namespace URI" in message
+    assert "Please configure MLFLOW_REGISTRY_URI" in message
+    assert expected_example_uri in message
+    assert "extra_env={'MLFLOW_REGISTRY_URI': '<registry URI>'}" in message
+    assert "spark_udf()" in message
+
+
+def test_namespace_as_registry_error_unparseable_uri_uses_v1alpha_example() -> None:
+    with pytest.raises(MlflowException) as exc_info:
+        raise_for_namespace_as_registry_uri("https://example.invalid/not-a-gcp-uri")
+    assert exc_info.value.error_code == "INVALID_PARAMETER_VALUE"
+    assert (
+        "https://mlflow.googleapis.com/v1alpha/projects/<project>/"
+        "locations/<location>/registries/<registry>"
+    ) in str(exc_info.value)
 
 
 def test_wire_dispatch_additional_registry_rpcs() -> None:
