@@ -198,7 +198,7 @@ def _validate_relative_gcs_segments(raw_path: str, *, label: str) -> None:
         )
 
 
-def _validate_artifact_path(artifact_path: str) -> str:
+def validate_artifact_path(artifact_path: str) -> str:
     """Validate and normalize a client artifact subpath.
 
     Matches backend GcsCabUriValidator.normalizeClientSubpath.
@@ -227,7 +227,10 @@ def _validate_artifact_path(artifact_path: str) -> str:
     return trimmed
 
 
-def _validate_gcs_artifact_uri(artifact_uri: str) -> tuple[str, str]:
+_validate_artifact_path = validate_artifact_path
+
+
+def validate_gcs_artifact_uri(artifact_uri: str) -> tuple[str, str]:
     """Validate and parse a GCS artifact URI.
 
     Returns:
@@ -271,6 +274,9 @@ def _validate_gcs_artifact_uri(artifact_uri: str) -> tuple[str, str]:
     )
     rel_path = raw_path.strip("/")
     return bucket, rel_path
+
+
+_validate_gcs_artifact_uri = validate_gcs_artifact_uri
 
 
 def derive_cab_directory_uri(artifact_uri: str) -> str:

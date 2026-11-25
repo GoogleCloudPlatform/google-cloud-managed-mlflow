@@ -494,6 +494,17 @@ class GcpGCSArtifactRepository(GCSArtifactRepository):
         if self._read_client is None:
             self._read_client = getattr(self, "client", client)
 
+        from google_cloud_managed_mlflow.uri import is_gcp_context
+
+        if (
+            self._cab_credentials is not None
+            or self._is_registered_model
+            or is_gcp_context(tracking_uri=tracking_uri, registry_uri=registry_uri)
+        ):
+            from google_cloud_managed_mlflow.spark import install_spark_hooks
+
+            install_spark_hooks()
+
     def _resolve_cab_credentials(
         self,
         artifact_uri: str,

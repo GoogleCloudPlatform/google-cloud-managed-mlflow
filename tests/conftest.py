@@ -44,6 +44,13 @@ def _reset_plugin_caches() -> None:
 
         reset_gcs_artifact_repo_state()
 
+    if "google_cloud_managed_mlflow.spark.hooks" in sys.modules:
+        from google_cloud_managed_mlflow.spark.hooks import (
+            reset_spark_hooks_for_testing,
+        )
+
+        reset_spark_hooks_for_testing()
+
 
 @pytest.fixture(autouse=True)
 def _reset_plugin_global_caches() -> Generator[None, None, None]:
@@ -60,6 +67,7 @@ _AMBIENT_GCP_ENV_VARS = (
     "GOOGLE_CLOUD_PROJECT",
     "GCLOUD_PROJECT",
     "CLOUDSDK_CORE_PROJECT",
+    "MLFLOW_TRACKING_AUTH",
 )
 
 
